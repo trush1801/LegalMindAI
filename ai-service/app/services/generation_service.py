@@ -38,8 +38,9 @@ def _get_llm():
     if not settings.GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not set in environment or settings.")
 
+    model_name = getattr(settings, "GEMINI_MODEL", None) or "gemini-2.0-flash"
     return ChatGoogleGenerativeAI(
-        model="gemini-3.8-flash",
+        model=model_name,
         google_api_key=settings.GEMINI_API_KEY,
         temperature=0.1,
         response_mime_type="application/json",

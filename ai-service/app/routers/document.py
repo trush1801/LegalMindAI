@@ -21,7 +21,7 @@ from app.services.clause_service import extract_clauses, evaluate_missing_provis
 from app.services.risk_service import analyze_document_risk, LEGAL_DISCLAIMER
 from app.services.summary_service import generate_document_summary
 from app.services.vector_service import create_and_save_faiss_index
-from app.services.classification_service import classify_document
+from app.services.classification_service import classify_document, fallback_classify
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,10 @@ class ProcessingResponse(BaseModel):
     # Classification
     classification:        dict = {}
     # Part 06 — Extraction
-    extraction_method:     str | None = None
-    total_pages:           int | None = None
+    extraction_method:       str | None = None
+    total_pages:             int | None = None
+    estimated_page_count:    int | None = None
+    page_count_is_estimated: bool = False
     # Part 07 — Preprocessing
     raw_chunks:            int | None = None
     processed_chunks:      int | None = None
@@ -89,6 +91,8 @@ class ProcessingResponse(BaseModel):
     disclaimer:            str | None = None
     # Part 10 — Summary & Vectors
     plain_summary:         str = ""
+    full_text:             str = ""
+    extracted_text:        str = ""
     key_points:            list[str] = []
     obligations:           list = []
     structured_obligations: list = []
@@ -136,16 +140,61 @@ async def process_document(
         f"type={document_type} | format={file_format}"
     )
 
-    # ── Save file ─────────────────────────────────────────────────
-    user_storage_dir = Path(settings.UPLOAD_DIR) / user_id
+    # ── Save file safely (Phase 1B — ERR-CRIT-002) ────────────────
+    base_storage_dir = Path(settings.UPLOAD_DIR).resolve()
+    # 1. Sanitize user_id to ensure it stays strictly within base_storage_dir
+    safe_user_id = Path(user_id).name
+    if not safe_user_id or safe_user_id in (".", "..") or "/" in user_id or "\\" in user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "INVALID_USER_ID", "message": "Invalid user directory specification."},
+        )
+    user_storage_dir = (base_storage_dir / safe_user_id).resolve()
+    try:
+        user_storage_dir.relative_to(base_storage_dir)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "PATH_TRAVERSAL_DETECTED", "message": "Storage path traversal detected."},
+        )
     user_storage_dir.mkdir(parents=True, exist_ok=True)
-    file_path = user_storage_dir / original_name
 
+    # 2. Extract and sanitize file extension
+    fmt = file_format.lower().lstrip(".")
+    raw_name = Path(original_name).name
+    if not raw_name or raw_name in (".", ".."):
+        raw_name = f"document.{fmt}"
+
+    file_ext = Path(raw_name).suffix.lower()
+    if file_ext not in [".pdf", ".docx", ".txt"]:
+        file_ext = f".{fmt}" if f".{fmt}" in [".pdf", ".docx", ".txt"] else ".pdf"
+
+    # 3. Create collision-free server-side filename incorporating document_id
+    safe_stem = re.sub(r'[^\w\s\.-]', '_', Path(raw_name).stem).strip() or "document"
+    safe_stored_name = f"{document_id}_{safe_stem}{file_ext}"
+
+    file_path = (user_storage_dir / safe_stored_name).resolve()
+
+    # 4. Strict boundary check: file_path must be strictly within user_storage_dir
+    try:
+        file_path.relative_to(user_storage_dir)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "PATH_TRAVERSAL_DETECTED", "message": "File path traversal detected."},
+        )
+
+    # 5. Write file with cleanup on failure
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        logger.info(f"File saved: {file_path}")
+        logger.info(f"File saved securely: {file_path}")
     except Exception as e:
+        if file_path.exists():
+            try:
+                file_path.unlink()
+            except Exception:
+                pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "FILE_SAVE_FAILED", "message": str(e)},
@@ -245,20 +294,24 @@ async def process_document(
     except Exception as e:
         logger.error(f"Preprocessing failed: {e}", exc_info=True)
 
-    # ── Document Classification ──────────────────────────────────
+    # ── Document Classification (Phase 1A — ERR-CRIT-001 & ERR-CLASS-001) ──
     classification_dict = {}
     try:
         sample_chunks = processed_chunks or (extraction_result.chunks if extraction_result else [])
-        full_text_sample = " ".join(c.text for c in sample_chunks[:10])
+        full_text_sample = " ".join(c.text for c in sample_chunks)
         clf_res = classify_document(
-            text=full_text_sample,
-            filename=original_name,
-            chunks=[c.to_dict() for c in processed_chunks] if processed_chunks else None,
+            full_text=full_text_sample,
+            title_hint=original_name,
+            declared_type=document_type or "",
         )
         classification_dict = clf_res.to_dict()
         logger.info(f"Classification: {clf_res.primary_category} / {clf_res.subtype} (conf={clf_res.confidence})")
     except Exception as e:
         logger.error(f"Classification failed: {e}", exc_info=True)
+        # Safe fallback based on title hint and declared type; never defaults to SDSA
+        fallback_res = fallback_classify(title_hint=original_name, declared_type=document_type or "")
+        classification_dict = fallback_res.to_dict()
+        logger.info(f"Using fallback classification: {fallback_res.primary_category} / {fallback_res.subtype}")
 
     # ── Analysis Stage (Part 08) ─────────────────────────
     parties, dates, amounts = [], [], []
@@ -289,7 +342,7 @@ async def process_document(
 
             missing_provisions  = evaluate_missing_provisions(
                 all_clauses,
-                classification_dict.get("subtype", "software_development_agreement"),
+                classification_dict.get("subtype") or "generic_contract",
             )
 
             clause_preview = [
@@ -318,7 +371,12 @@ async def process_document(
     try:
         if clause_res and clause_res.clauses:
             clauses_dicts = [c.to_dict() for c in clause_res.clauses]
-            risk_res = analyze_document_risk(clauses_dicts, document_id)
+            risk_res = analyze_document_risk(
+                clauses_dicts,
+                document_id,
+                doc_category=classification_dict.get("primary_category", ""),
+                doc_type=classification_dict.get("subtype", ""),
+            )
 
             overall_risk_score = risk_res.overall_risk_score
             overall_risk_level = risk_res.overall_risk_level
@@ -358,7 +416,10 @@ async def process_document(
             plain_summary          = summary_res.plain_language_summary
             key_points             = summary_res.key_points
             obligations            = summary_res.obligations
-            structured_obligations = getattr(summary_res, "structured_obligations", [])
+            structured_obligations = [
+                o.to_dict() if hasattr(o, "to_dict") else o
+                for o in getattr(summary_res, "structured_obligations", [])
+            ]
             important_dates        = summary_res.important_dates
 
             # 2. Embed Chunks & Build FAISS Vector Index
@@ -374,6 +435,18 @@ async def process_document(
             )
     except Exception as e:
         logger.error(f"Part 10 Summary/FAISS stage error: {e}", exc_info=True)
+
+    # Construct complete extracted text from all extraction chunks (ERR-DATA-001)
+    full_extracted_text = ""
+    if extraction_result and getattr(extraction_result, "chunks", None):
+        full_extracted_text = "\n\n".join(
+            c.text for c in extraction_result.chunks if getattr(c, "text", None)
+        ).strip()
+    elif processed_chunks:
+        full_extracted_text = "\n\n".join(
+            getattr(c, "text", "") if hasattr(c, "text") else c.get("text", "")
+            for c in processed_chunks
+        ).strip()
 
     return ProcessingResponse(
         success=True,
@@ -392,6 +465,8 @@ async def process_document(
         classification=classification_dict,
         extraction_method=extraction_method,
         total_pages=total_pages,
+        estimated_page_count=getattr(extraction_result, "estimated_page_count", total_pages) if extraction_result else total_pages,
+        page_count_is_estimated=getattr(extraction_result, "page_count_is_estimated", False) if extraction_result else False,
         raw_chunks=raw_chunk_count,
         processed_chunks=len(processed_chunks),
         total_words=total_words,
@@ -417,6 +492,8 @@ async def process_document(
         risk_findings=risk_findings,
         disclaimer=LEGAL_DISCLAIMER,
         plain_summary=plain_summary,
+        full_text=full_extracted_text,
+        extracted_text=full_extracted_text,
         key_points=key_points,
         obligations=obligations,
         structured_obligations=structured_obligations,

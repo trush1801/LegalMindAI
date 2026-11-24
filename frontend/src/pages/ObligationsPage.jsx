@@ -39,6 +39,7 @@ export default function ObligationsPage() {
   const [_reminders, setReminders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [processingCount, setProcessingCount] = useState(0);
 
   const [search, setSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('ALL');
@@ -57,13 +58,15 @@ export default function ObligationsPage() {
   const [savingReminder, setSavingReminder] = useState(false);
   const [reminderError, setReminderError] = useState(null);
 
-  const fetchData = async () => {
+  const fetchData = async (isPolling = false) => {
     try {
-      setLoading(true);
+      if (!isPolling) {
+        setLoading(true);
+      }
       setError(null);
 
       const [obRes, remRes] = await Promise.all([
-        documentAPI.getUpcomingObligations().catch(() => ({ data: { data: { obligations: [] } } })),
+        documentAPI.getUpcomingObligations(),
         documentAPI.getAllReminders().catch(() => ({ data: { data: { reminders: [] } } })),
       ]);
 
@@ -73,6 +76,11 @@ export default function ObligationsPage() {
         (Array.isArray(obRes?.data?.data) ? obRes.data.data : null) ||
         (Array.isArray(obRes?.data) ? obRes.data : []);
 
+      const pCount =
+        obRes?.data?.data?.processingCount ??
+        obRes?.data?.processingCount ??
+        0;
+
       const rawReminders =
         remRes?.data?.data?.reminders ||
         remRes?.data?.reminders ||
@@ -81,11 +89,14 @@ export default function ObligationsPage() {
 
       setObligations(Array.isArray(rawObligations) ? rawObligations : []);
       setReminders(Array.isArray(rawReminders) ? rawReminders : []);
+      setProcessingCount(typeof pCount === 'number' ? pCount : 0);
     } catch (err) {
       console.error('Failed to load obligations portfolio:', err);
-      setError('Unable to load obligations portfolio. Please refresh.');
+      setError(err?.response?.data?.error?.message || err?.message || 'Unable to load obligations portfolio. Please refresh.');
     } finally {
-      setLoading(false);
+      if (!isPolling) {
+        setLoading(false);
+      }
     }
   };
 
@@ -93,11 +104,28 @@ export default function ObligationsPage() {
     fetchData();
   }, []);
 
-  // Compute KPI metrics
+  // Auto-poll when documents are actively processing in background
+  useEffect(() => {
+    if (processingCount > 0) {
+      const timer = setTimeout(() => {
+        fetchData(true);
+      }, 3500);
+      return () => clearTimeout(timer);
+    }
+  }, [processingCount]);
+
+  // Compute KPI metrics accurately
   const totalCount = obligations.length;
-  const explicitCount = obligations.filter((o) => o.certainty === 'EXPLICIT').length;
-  const inferredCount = obligations.filter((o) => o.certainty === 'INFERRED' || o.dateType === 'relative_duration').length;
-  const activeReminderCount = obligations.filter((o) => o.hasActiveReminder).length;
+  const explicitCount = obligations.filter(
+    (o) => o.dateType === 'explicit_calendar' && o.certainty === 'EXPLICIT'
+  ).length;
+  const relativeCount = obligations.filter(
+    (o) => o.dateType === 'relative_duration' || o.certainty === 'RELATIVE' || (o.certainty === 'INFERRED' && o.dateType !== 'conditional_trigger')
+  ).length;
+  const conditionalCount = obligations.filter(
+    (o) => o.dateType === 'conditional_trigger' || o.certainty === 'CONDITIONAL' || o.certainty === 'UNCERTAIN'
+  ).length;
+  const activeReminderCount = obligations.filter((o) => Boolean(o.hasActiveReminder)).length;
 
   // Filtered dataset
   const filteredItems = useMemo(() => {
@@ -106,18 +134,33 @@ export default function ObligationsPage() {
       if (selectedCategory !== 'ALL' && item.category !== selectedCategory) {
         return false;
       }
-      // Certainty filter
-      if (selectedCertainty !== 'ALL' && item.certainty !== selectedCertainty) {
-        return false;
+      // Certainty / Classification filter
+      if (selectedCertainty !== 'ALL') {
+        if (selectedCertainty === 'EXPLICIT') {
+          if (item.dateType !== 'explicit_calendar' || item.certainty !== 'EXPLICIT') {
+            return false;
+          }
+        } else if (selectedCertainty === 'INFERRED' || selectedCertainty === 'RELATIVE') {
+          if (item.dateType !== 'relative_duration' && item.certainty !== 'INFERRED' && item.certainty !== 'RELATIVE') {
+            return false;
+          }
+        } else if (selectedCertainty === 'UNCERTAIN' || selectedCertainty === 'CONDITIONAL') {
+          if (item.dateType !== 'conditional_trigger' && item.certainty !== 'CONDITIONAL' && item.certainty !== 'UNCERTAIN') {
+            return false;
+          }
+        }
       }
-      // Search filter
+      // Search filter across title, document, dates, parties, action items and sections
       if (search.trim()) {
         const q = search.toLowerCase();
         const matchesTitle = (item.title || '').toLowerCase().includes(q);
         const matchesDoc = (item.documentTitle || '').toLowerCase().includes(q);
-        const matchesPassage = (item.sourcePassage || '').toLowerCase().includes(q);
-        const matchesDate = (item.rawDateText || item.formattedDueDate || '').toLowerCase().includes(q);
-        if (!matchesTitle && !matchesDoc && !matchesPassage && !matchesDate) {
+        const matchesPassage = (item.sourcePassage || item.supportingEvidence || '').toLowerCase().includes(q);
+        const matchesDate = (item.rawDateText || item.formattedDueDate || item.date || '').toLowerCase().includes(q);
+        const matchesParty = (item.party || item.boundParty || '').toLowerCase().includes(q);
+        const matchesAction = (item.actionRequired || item.action || '').toLowerCase().includes(q);
+        const matchesSection = (item.section || '').toLowerCase().includes(q);
+        if (!matchesTitle && !matchesDoc && !matchesPassage && !matchesDate && !matchesParty && !matchesAction && !matchesSection) {
           return false;
         }
       }
@@ -129,7 +172,7 @@ export default function ObligationsPage() {
   const openReminderModal = (item) => {
     setSelectedItemForReminder(item);
     setReminderTitle(item.title || 'Contract Deadline');
-    const initialDue = item.parsedDueDate ? new Date(item.parsedDueDate).toISOString().split('T')[0] : '';
+    const initialDue = item.parsedDueDate ? String(item.parsedDueDate).split('T')[0] : '';
     setReminderDueDate(initialDue);
     setOffsetPreset('30');
     setCustomReminderDate('');
@@ -147,26 +190,36 @@ export default function ObligationsPage() {
       setSavingReminder(true);
       setReminderError(null);
 
+      const isConditional =
+        selectedItemForReminder.dateType === 'conditional_trigger' ||
+        selectedItemForReminder.certainty === 'CONDITIONAL' ||
+        selectedItemForReminder.certainty === 'UNCERTAIN';
+
       const offset = parseInt(offsetPreset, 10);
       let calculatedReminderDate = null;
 
       if (customReminderDate) {
-        calculatedReminderDate = new Date(customReminderDate).toISOString();
+        calculatedReminderDate = new Date(customReminderDate + 'T09:00:00Z').toISOString();
       } else if (reminderDueDate) {
-        const d = new Date(reminderDueDate);
-        d.setDate(d.getDate() - (isNaN(offset) ? 30 : offset));
+        const d = new Date(reminderDueDate + 'T00:00:00Z');
+        d.setUTCDate(d.getUTCDate() - (isNaN(offset) ? 30 : offset));
         calculatedReminderDate = d.toISOString();
       } else {
-        const fallback = new Date();
-        fallback.setDate(fallback.getDate() + 7);
-        calculatedReminderDate = fallback.toISOString();
+        // Do NOT silently fabricate a fake date for conditional obligations
+        setReminderError(
+          isConditional
+            ? 'This is a conditional obligation. Please specify an anticipated event milestone or enter an explicit alert date.'
+            : 'Please enter a target deadline or specify an explicit alert date.'
+        );
+        setSavingReminder(false);
+        return;
       }
 
       const payload = {
         obligationId: selectedItemForReminder.id,
         title: reminderTitle || selectedItemForReminder.title,
         category: selectedItemForReminder.category,
-        dueDate: reminderDueDate ? new Date(reminderDueDate).toISOString() : calculatedReminderDate,
+        dueDate: reminderDueDate ? new Date(reminderDueDate + 'T00:00:00Z').toISOString() : null,
         reminderDate: calculatedReminderDate,
         offsetDays: isNaN(offset) ? 30 : offset,
         notificationChannel,
@@ -246,34 +299,61 @@ export default function ObligationsPage() {
           </div>
         </div>
 
+        {/* Processing In-Progress Banner */}
+        {processingCount > 0 && (
+          <div
+            className="card mb-4 flex items-center justify-between gap-3"
+            style={{
+              padding: 'var(--space-3) var(--space-4)',
+              borderLeft: '3px solid var(--color-primary)',
+              background: 'var(--color-surface-2)',
+            }}
+          >
+            <div className="flex items-center gap-3">
+              <RefreshCw size={16} className="animate-spin" color="var(--color-primary)" />
+              <div>
+                <div style={{ fontSize: 'var(--text-xs)', fontWeight: 600 }}>
+                  Analyzing {processingCount} contract{processingCount > 1 ? 's' : ''} in progress...
+                </div>
+                <div className="text-xs muted">
+                  Extracting contractual obligations, payment horizons, and notice deadlines. This page will update automatically.
+                </div>
+              </div>
+            </div>
+            <span className="badge badge-warning text-xs">Processing</span>
+          </div>
+        )}
+
         {/* KPI Strip */}
         <div className="grid-4 mb-4">
           <div className="stat-metric-card">
             <div>
-              <div className="form-hint">Total Tracked Obligations</div>
-              <div className="stat-metric-val">{totalCount}</div>
-            </div>
-            <CalendarClock size={22} color="var(--color-primary)" />
-          </div>
-
-          <div className="stat-metric-card">
-            <div>
               <div className="form-hint">Explicit Calendar Dates</div>
-              <div className="stat-metric-val" style={{ color: 'var(--color-success)' }}>
+              <div className="stat-metric-val" style={{ color: 'var(--color-primary)' }}>
                 {explicitCount}
               </div>
             </div>
-            <Calendar size={22} color="var(--color-success)" />
+            <Calendar size={22} color="var(--color-primary)" />
           </div>
 
           <div className="stat-metric-card">
             <div>
-              <div className="form-hint">Inferred / Relative Terms</div>
+              <div className="form-hint">Relative Durations</div>
               <div className="stat-metric-val" style={{ color: 'var(--color-warning)' }}>
-                {inferredCount}
+                {relativeCount}
               </div>
             </div>
             <Clock size={22} color="var(--color-warning)" />
+          </div>
+
+          <div className="stat-metric-card">
+            <div>
+              <div className="form-hint">Conditional / Event-Triggered</div>
+              <div className="stat-metric-val" style={{ color: 'var(--color-text-secondary)' }}>
+                {conditionalCount}
+              </div>
+            </div>
+            <AlertCircle size={22} color="var(--color-text-secondary)" />
           </div>
 
           <div className="stat-metric-card">
@@ -310,10 +390,10 @@ export default function ObligationsPage() {
                 value={selectedCertainty}
                 onChange={(e) => setSelectedCertainty(e.target.value)}
               >
-                <option value="ALL">All Certainty Levels</option>
-                <option value="EXPLICIT">Explicit Dates Only</option>
-                <option value="INFERRED">Inferred / Relative</option>
-                <option value="UNCERTAIN">Uncertain / Open Horizons</option>
+                <option value="ALL">All Categories ({totalCount})</option>
+                <option value="EXPLICIT">Explicit Dates Only ({explicitCount})</option>
+                <option value="INFERRED">Relative Durations ({relativeCount})</option>
+                <option value="UNCERTAIN">Conditional / Event-Triggered ({conditionalCount})</option>
               </select>
             </div>
 
@@ -378,17 +458,27 @@ export default function ObligationsPage() {
             </button>
           </div>
         ) : filteredItems.length === 0 ? (
-          <div className="card empty-state p-6 text-center">
-            <CalendarClock size={36} color="var(--color-text-secondary)" style={{ margin: '0 auto 1rem' }} />
-            <h3>No obligations match your filter</h3>
-            <p className="muted text-sm mt-1 max-w-md" style={{ margin: '0 auto' }}>
-              Upload contracts or adjust your search parameters to view extracted start dates, expiration horizons, notice periods, and payment deadlines.
-            </p>
-            <button className="btn btn-primary mt-4" onClick={() => setUploadModalOpen(true)}>
-              <Plus size={15} />
-              <span>Upload Contract</span>
-            </button>
-          </div>
+          processingCount > 0 ? (
+            <div className="card empty-state p-6 text-center">
+              <RefreshCw size={36} className="animate-spin" color="var(--color-primary)" style={{ margin: '0 auto 1rem' }} />
+              <h3>Obligations Extraction In Progress</h3>
+              <p className="muted text-sm mt-1 max-w-md" style={{ margin: '0 auto' }}>
+                {processingCount} contract{processingCount > 1 ? 's are' : ' is'} currently being analyzed for contractual obligations, renewal deadlines, and payment terms. Extracted milestones will appear here as soon as processing completes.
+              </p>
+            </div>
+          ) : (
+            <div className="card empty-state p-6 text-center">
+              <CalendarClock size={36} color="var(--color-text-secondary)" style={{ margin: '0 auto 1rem' }} />
+              <h3>No obligations match your filter</h3>
+              <p className="muted text-sm mt-1 max-w-md" style={{ margin: '0 auto' }}>
+                Upload contracts or adjust your search parameters to view extracted start dates, expiration horizons, notice periods, and payment deadlines.
+              </p>
+              <button className="btn btn-primary mt-4" onClick={() => setUploadModalOpen(true)}>
+                <Plus size={15} />
+                <span>Upload Contract</span>
+              </button>
+            </div>
+          )
         ) : viewMode === 'timeline' ? (
           /* Timeline Track View */
           <div className="timeline-track-container" style={{ position: 'relative', paddingLeft: '2.5rem' }}>
@@ -498,7 +588,7 @@ export default function ObligationsPage() {
                           <div className="flex items-center gap-2">
                             <span className="badge badge-success text-xs flex items-center gap-1">
                               <CheckCircle2 size={12} />
-                              <span>Reminder: {new Date(item.activeReminder.reminderDate).toLocaleDateString()}</span>
+                              <span>Scheduled Reminder: {new Date(item.activeReminder.reminderDate).toLocaleDateString(undefined, { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' })}</span>
                             </span>
                             <button
                               type="button"
@@ -519,14 +609,51 @@ export default function ObligationsPage() {
                             </button>
                           </div>
                         ) : (
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
-                            onClick={() => openReminderModal(item)}
-                          >
-                            <Bell size={12} />
-                            <span>Schedule Reminder</span>
-                          </button>
+                          <div className="flex items-center gap-2">
+                            {item.dateType === 'conditional_trigger' || item.certainty === 'CONDITIONAL' ? (
+                              <>
+                                <span className="badge badge-neutral text-xs" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-secondary)' }}>
+                                  Suggested: Event-Triggered
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                                  onClick={() => openReminderModal(item)}
+                                >
+                                  <Bell size={12} />
+                                  <span>Configure Policy Reminder</span>
+                                </button>
+                              </>
+                            ) : item.dateType === 'relative_duration' ? (
+                              <>
+                                <span className="badge badge-neutral text-xs" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-secondary)' }}>
+                                  Suggested: Relative Horizon
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                                  onClick={() => openReminderModal(item)}
+                                >
+                                  <Bell size={12} />
+                                  <span>Schedule Reminder</span>
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <span className="badge badge-neutral text-xs" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-secondary)' }}>
+                                  Suggested: Calendar Milestone
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                                  onClick={() => openReminderModal(item)}
+                                >
+                                  <Bell size={12} />
+                                  <span>Schedule Reminder</span>
+                                </button>
+                              </>
+                            )}
+                          </div>
                         )}
 
                         <button
@@ -616,7 +743,7 @@ export default function ObligationsPage() {
                       <div className="flex items-center gap-2">
                         <span className="badge badge-success text-xs flex items-center gap-1">
                           <CheckCircle2 size={12} />
-                          <span>Reminder: {new Date(item.activeReminder.reminderDate).toLocaleDateString()}</span>
+                          <span>Scheduled Reminder: {new Date(item.activeReminder.reminderDate).toLocaleDateString(undefined, { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' })}</span>
                         </span>
                         <button
                           type="button"
@@ -637,14 +764,51 @@ export default function ObligationsPage() {
                         </button>
                       </div>
                     ) : (
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
-                        onClick={() => openReminderModal(item)}
-                      >
-                        <Bell size={12} />
-                        <span>Schedule Reminder</span>
-                      </button>
+                      <div className="flex items-center gap-2">
+                        {item.dateType === 'conditional_trigger' || item.certainty === 'CONDITIONAL' ? (
+                          <>
+                            <span className="badge badge-neutral text-xs" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-secondary)' }}>
+                              Suggested: Event-Triggered
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                              onClick={() => openReminderModal(item)}
+                            >
+                              <Bell size={12} />
+                              <span>Configure Policy Reminder</span>
+                            </button>
+                          </>
+                        ) : item.dateType === 'relative_duration' ? (
+                          <>
+                            <span className="badge badge-neutral text-xs" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-secondary)' }}>
+                              Suggested: Relative Horizon
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                              onClick={() => openReminderModal(item)}
+                            >
+                              <Bell size={12} />
+                              <span>Schedule Reminder</span>
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <span className="badge badge-neutral text-xs" style={{ background: 'var(--color-surface-2)', color: 'var(--color-text-secondary)' }}>
+                              Suggested: Calendar Milestone
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm text-xs flex items-center gap-1"
+                              onClick={() => openReminderModal(item)}
+                            >
+                              <Bell size={12} />
+                              <span>Schedule Reminder</span>
+                            </button>
+                          </>
+                        )}
+                      </div>
                     )}
 
                     <button
@@ -684,6 +848,19 @@ export default function ObligationsPage() {
 
               <form onSubmit={handleSaveReminder}>
                 <div className="modal-body">
+                  {(selectedItemForReminder.dateType === 'conditional_trigger' || selectedItemForReminder.certainty === 'CONDITIONAL') && (
+                    <div
+                      className="card mb-3 text-xs"
+                      style={{
+                        background: 'var(--color-surface-2)',
+                        borderLeft: '3px solid var(--color-warning)',
+                        padding: '0.6rem 0.8rem',
+                      }}
+                    >
+                      <strong>Conditional Trigger Policy:</strong> This obligation depends on an event (e.g. &ldquo;{selectedItemForReminder.formattedDueDate || selectedItemForReminder.title}&rdquo;) that has not occurred. To schedule an alert, configure an anticipated milestone date or specify an explicit alert date.
+                    </div>
+                  )}
+
                   <div className="form-group mb-3">
                     <label className="form-label">Reminder Title</label>
                     <input
@@ -696,14 +873,33 @@ export default function ObligationsPage() {
                   </div>
 
                   <div className="form-group mb-3">
-                    <label className="form-label">Contract Due / Milestone Date</label>
+                    <label className="form-label">
+                      {selectedItemForReminder.dateType === 'conditional_trigger' || selectedItemForReminder.certainty === 'CONDITIONAL'
+                        ? 'Anticipated Event / Trigger Horizon (Optional)'
+                        : 'Contract Due / Milestone Date'}
+                    </label>
                     <input
                       type="date"
                       className="form-input"
                       value={reminderDueDate}
                       onChange={(e) => setReminderDueDate(e.target.value)}
                     />
-                    <div className="form-hint">Reference date of the contract deadline.</div>
+                    <div className="form-hint">
+                      {selectedItemForReminder.dateType === 'conditional_trigger' || selectedItemForReminder.certainty === 'CONDITIONAL'
+                        ? 'Leave blank if the triggering event has not yet occurred.'
+                        : 'Reference date of the contract deadline.'}
+                    </div>
+                  </div>
+
+                  <div className="form-group mb-3">
+                    <label className="form-label">Explicit Alert Date (Direct Trigger)</label>
+                    <input
+                      type="date"
+                      className="form-input"
+                      value={customReminderDate}
+                      onChange={(e) => setCustomReminderDate(e.target.value)}
+                    />
+                    <div className="form-hint">Set an exact calendar date to receive the alert notification.</div>
                   </div>
 
                   <div className="form-group mb-3">

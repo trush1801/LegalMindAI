@@ -96,6 +96,7 @@ class DateDetail:
     page:                   int = 1
     section:                Optional[str] = None
     confidence:             float = 0.90
+    semantic_category:      str = "DEADLINE"  # DEADLINE | DURATION | EFFECTIVE_DATE | EXPIRY_DATE | NOTICE_PERIOD | SURVIVAL_PERIOD | RECURRING_FREQUENCY | CONDITION_TRIGGERED_PERIOD
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -141,7 +142,7 @@ DATE_PAT = re.compile(
 DURATION_PAT = re.compile(
     r'(?<!\w)(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|thirty|sixty|ninety)\s*'
     r'(?:\([A-Za-z0-9]+\)\s*)?'
-    r'(?:calendar\s+|business\s+)?(?:days?|weeks?|months?|years?)\b',
+    r'(?:calendar\s+|business\s+)?(?:hours?|days?|weeks?|months?|years?)\b',
     re.IGNORECASE
 )
 
@@ -171,19 +172,47 @@ def _is_invalid_date_candidate(text: str) -> bool:
 
 def _extract_structured_parties(chunks: list) -> list[PartyDetail]:
     parties: list[PartyDetail] = []
-    
-    # 1. Combine first few chunks (Section 1 / Preamble)
+
+    # Section/heading strings that must NEVER be treated as party names
+    _SECTION_HEADINGS_BLACKLIST = {
+        "signatures", "signature", "witness", "witnesses", "execution",
+        "signatories", "authorized signatory", "in witness whereof",
+        "signed by", "for and on behalf", "schedule", "annexure", "exhibit",
+        "appendix", "schedule a", "schedule b", "preamble",
+    }
+
+    # Supported role headings (two-column table pattern)
+    _ROLE1_HEADERS = {
+        "CLIENT", "EMPLOYER", "LANDLORD", "BUYER", "FIRST PARTY",
+        "LESSOR", "LENDER", "COMPANY", "THE COMPANY",
+    }
+    _ROLE2_HEADERS = {
+        "SERVICE PROVIDER", "EMPLOYEE", "TENANT", "SELLER", "SECOND PARTY",
+        "LESSEE", "BORROWER", "DEVELOPER", "CONTRACTOR", "VENDOR", "THE EMPLOYEE",
+    }
+    _ROLE_CANONICAL = {
+        "CLIENT": "CLIENT", "EMPLOYER": "EMPLOYER", "LANDLORD": "LANDLORD",
+        "BUYER": "BUYER", "FIRST PARTY": "FIRST PARTY", "LESSOR": "LESSOR",
+        "LENDER": "LENDER", "COMPANY": "COMPANY", "THE COMPANY": "COMPANY",
+        "SERVICE PROVIDER": "SERVICE PROVIDER", "EMPLOYEE": "EMPLOYEE",
+        "TENANT": "TENANT", "SELLER": "SELLER", "SECOND PARTY": "SECOND PARTY",
+        "LESSEE": "LESSEE", "BORROWER": "BORROWER", "DEVELOPER": "DEVELOPER",
+        "CONTRACTOR": "CONTRACTOR", "VENDOR": "VENDOR", "THE EMPLOYEE": "EMPLOYEE",
+    }
+
+    # 1. Combine first few chunks (Section 1 / Preamble) for party search
     p1_text = ""
     sig_text = ""
     for c in chunks:
         sec = str(getattr(c, "section", "")).upper()
         txt = getattr(c, "text", "")
-        if getattr(c, "page", 1) == 1 or "PARTIES" in sec:
+        if getattr(c, "page", 1) == 1 or "PARTIES" in sec or sec == "1":
             p1_text += "\n" + txt
-        if "SIGNATURE" in sec or "WITNESS" in txt.upper() or getattr(c, "page", 1) == chunks[-1].page:
+        # Only gather signature data for signatory name extraction
+        if "SIGNATURE" in sec or "WITNESS" in txt.upper():
             sig_text += "\n" + txt
 
-    # Extract signatories from signature chunk
+    # Extract signatories from signature chunk (names/titles only — not party entities)
     names_titles = re.findall(r'Name:\s*([^\n_]+)\s*\n\s*Title:\s*([^\n_]+)', sig_text)
     client_sig_name = names_titles[0][0].strip() if len(names_titles) > 0 else None
     client_sig_title = names_titles[0][1].strip() if len(names_titles) > 0 else None
@@ -192,21 +221,33 @@ def _extract_structured_parties(chunks: list) -> list[PartyDetail]:
 
     lines = [l.strip() for l in p1_text.splitlines() if l.strip()]
 
-    # Check for two-column table layout: CLIENT \n SERVICE PROVIDER
+    # Check for two-column table layout: ROLE1 \n ROLE2 \n Name1 ... \n Name2
     for i in range(len(lines) - 4):
         h1 = lines[i].upper()
-        h2 = lines[i+1].upper()
-        if h1 in ('CLIENT', 'EMPLOYER', 'LANDLORD', 'BUYER', 'FIRST PARTY', 'LESSOR', 'LENDER') and \
-           h2 in ('SERVICE PROVIDER', 'EMPLOYEE', 'TENANT', 'SELLER', 'SECOND PARTY', 'LESSEE', 'BORROWER', 'DEVELOPER', 'CONTRACTOR', 'VENDOR'):
-            role1 = h1
-            role2 = h2
+        h2 = lines[i + 1].upper()
 
-            p1_name = lines[i+2]
-            p1_name = re.sub(r'^(?:CLIENT|SERVICE PROVIDER)\s+', '', p1_name, flags=re.I).strip()
+        # Skip if either header is a blacklisted section heading
+        if h1.lower() in _SECTION_HEADINGS_BLACKLIST or h2.lower() in _SECTION_HEADINGS_BLACKLIST:
+            continue
+
+        if h1 in _ROLE1_HEADERS and h2 in _ROLE2_HEADERS:
+            role1 = _ROLE_CANONICAL.get(h1, h1)
+            role2 = _ROLE_CANONICAL.get(h2, h2)
+
+            p1_name = lines[i + 2]
+            p1_name = re.sub(r'^(?:CLIENT|SERVICE PROVIDER|COMPANY|EMPLOYEE)\s+', '', p1_name, flags=re.I).strip()
+
+            # Guard: skip if extracted "name" is itself a blacklisted heading or too short
+            if p1_name.lower() in _SECTION_HEADINGS_BLACKLIST or len(p1_name) < 3:
+                continue
+
             idx = i + 3
             p1_addr_parts = []
             p1_email = None
             while idx < len(lines) and not lines[idx].lower().startswith('email:'):
+                # Stop if we hit another role header
+                if lines[idx].upper() in _ROLE2_HEADERS or lines[idx].upper() in _ROLE1_HEADERS:
+                    break
                 p1_addr_parts.append(lines[idx])
                 idx += 1
             if idx < len(lines) and lines[idx].lower().startswith('email:'):
@@ -215,8 +256,18 @@ def _extract_structured_parties(chunks: list) -> list[PartyDetail]:
 
             if idx < len(lines):
                 p2_name = lines[idx]
-                p2_name = re.sub(r'^(?:CLIENT|SERVICE PROVIDER)\s+', '', p2_name, flags=re.I).strip()
-                idx += 1
+                p2_name = re.sub(r'^(?:CLIENT|SERVICE PROVIDER|COMPANY|EMPLOYEE)\s+', '', p2_name, flags=re.I).strip()
+
+                # Guard: skip if extracted "name" is a blacklisted heading
+                if p2_name.lower() in _SECTION_HEADINGS_BLACKLIST or len(p2_name) < 3:
+                    idx += 1
+                    if idx < len(lines):
+                        p2_name = lines[idx]
+                        p2_name = re.sub(r'^(?:CLIENT|SERVICE PROVIDER|COMPANY|EMPLOYEE)\s+', '', p2_name, flags=re.I).strip()
+                        idx += 1
+                else:
+                    idx += 1
+
                 p2_addr_parts = []
                 p2_email = None
                 while idx < len(lines) and not lines[idx].lower().startswith('email:'):
@@ -245,21 +296,57 @@ def _extract_structured_parties(chunks: list) -> list[PartyDetail]:
                 ))
                 return parties
 
-    # Fallback: standard inline "between Party A and Party B"
+    # Fallback: standard inline "between Party A (the Company) and Party B (the Employee)"
+    quote_pattern = r"['\"\u201c\u201d]"
     pair_match = re.search(
-        r'(?i)between\s+([A-Z][A-Za-z0-9\s\.\&\,\-]+?)\s*\([\"\'\w\s]*?(?:Client|Company|Employer)[\"\'\w\s]*?\)\s+and\s+([A-Z][A-Za-z0-9\s\.\&\,\-]+?)\s*\([\"\'\w\s]*?(?:Service\s*Provider|Vendor|Employee)[\"\'\w\s]*?\)',
+        r"(?i)between:?\s+([A-Z][A-Za-z0-9\s\.,&]+?)"
+        r"(?:,\s*(?:a|an|having|with|residing|located)\s+[^\n(]+?)?"
+        r"\s*\(\s*(?:the\s*)?" + quote_pattern + r"?\s*(Company|Client|Employer|Landlord|Lessor|Buyer|Lender)\s*" + quote_pattern + r"?\s*\)"
+        r"\s*,?\s*and\s+([A-Z][A-Za-z0-9\s\.,&]+?)"
+        r"(?:,\s*(?:a|an|having|with|residing|located)\s+[^\n(]+?)?"
+        r"\s*\(\s*(?:the\s*)?" + quote_pattern + r"?\s*(Employee|Service\s*Provider|Vendor|Tenant|Lessee|Seller|Borrower|Developer|Contractor)\s*" + quote_pattern + r"?\s*\)",
         p1_text
     )
     if pair_match:
-        parties.append(PartyDetail(name=pair_match.group(1).strip(), role="CLIENT", page=1))
-        parties.append(PartyDetail(name=pair_match.group(2).strip(), role="SERVICE PROVIDER", page=1))
+        p1_raw = pair_match.group(1).strip()
+        r1_raw = pair_match.group(2).strip().upper()
+        p2_raw = pair_match.group(3).strip()
+        r2_raw = pair_match.group(4).strip().upper()
+
+        p1_clean = re.sub(r",\s*(?:a|an|having|with|residing|located)\s+.*$", "", p1_raw).strip()
+        p2_clean = re.sub(r",\s*(?:a|an|having|with|residing|located)\s+.*$", "", p2_raw).strip()
+
+        addr1_m = re.search(r"(?i)(?:having\s+its\s+(?:principal\s+)?office\s+at|with\s+offices\s+at)\s+([^\n(]+?)\s*\(", p1_text)
+        addr2_m = re.search(r"(?i)(?:residing\s+at|having\s+its\s+(?:principal\s+)?office\s+at|with\s+offices\s+at)\s+([^\n(]+?)\s*\(", p1_text)
+
+        p1_addr = addr1_m.group(1).strip() if addr1_m else None
+        p2_addr = addr2_m.group(1).strip() if addr2_m else None
+
+        role1 = _ROLE_CANONICAL.get(r1_raw, r1_raw)
+        role2 = _ROLE_CANONICAL.get(r2_raw, r2_raw)
+
+        parties.append(PartyDetail(name=p1_clean, role=role1, address=p1_addr, page=1))
+        parties.append(PartyDetail(name=p2_clean, role=role2, address=p2_addr, page=1))
+        return parties
+
+    # Secondary inline pattern: "between Party A ... and Party B ..."
+    if not parties:
+        inline2 = re.search(
+            r"(?i)between:?\s+([A-Z][A-Za-z0-9\s\.,&]+?)(?:,\s*[^\n(]+?)?\s*\(\s*(?:the\s*)?" + quote_pattern + r"?([A-Za-z\s]+?)" + quote_pattern + r"?\s*\)"
+            r"\s*,?\s*and\s+([A-Z][A-Za-z0-9\s\.,&]+?)(?:,\s*[^\n(]+?)?\s*\(\s*(?:the\s*)?" + quote_pattern + r"?([A-Za-z\s]+?)" + quote_pattern + r"?\s*\)",
+            p1_text
+        )
+        if inline2:
+            n1 = re.sub(r",\s*(?:a|an|having|with|residing|located)\s+.*$", "", inline2.group(1).strip()).strip()
+            r1 = inline2.group(2).strip().upper()
+            n2 = re.sub(r",\s*(?:a|an|having|with|residing|located)\s+.*$", "", inline2.group(3).strip()).strip()
+            r2 = inline2.group(4).strip().upper()
+            if len(n1) > 2 and len(n2) > 2 and n1.lower() not in _SECTION_HEADINGS_BLACKLIST:
+                parties.append(PartyDetail(name=n1, role=_ROLE_CANONICAL.get(r1, r1), page=1))
+                parties.append(PartyDetail(name=n2, role=_ROLE_CANONICAL.get(r2, r2), page=1))
+                return parties
 
     return parties
-
-
-# ─────────────────────────────────────────────────────────────
-# Financial Terms Extraction
-# ─────────────────────────────────────────────────────────────
 
 def _extract_structured_finances(chunks: list) -> list[FinancialDetail]:
     finances: list[FinancialDetail] = []
@@ -329,6 +416,55 @@ def _extract_structured_finances(chunks: list) -> list[FinancialDetail]:
     return finances
 
 
+def classify_temporal_semantics(raw_text: str, context: str = "") -> str:
+    """
+    Classify a temporal expression into one of the 8 canonical semantic classes:
+      - EFFECTIVE_DATE
+      - EXPIRY_DATE
+      - SURVIVAL_PERIOD
+      - DURATION
+      - NOTICE_PERIOD
+      - CONDITION_TRIGGERED_PERIOD
+      - DEADLINE
+      - RECURRING_FREQUENCY
+    """
+    combined = f"{raw_text} {context}".lower()
+    if re.search(r'\b(?:effective(?:\s+date|\s+as\s+of)?|commenc\w+)\b', combined) and not re.search(r'\b(?:within|after|notice)\b', combined):
+        return "EFFECTIVE_DATE"
+    if re.search(r'\b(?:expir\w+|maturity(?:\s+date)?)\b', combined) and not re.search(r'\b(?:surviv\w+|after)\b', combined):
+        return "EXPIRY_DATE"
+    if re.search(r'\b(?:surviv\w+|continue\s+for\s+\d+|post[- ]termination|after\s+employment\s+ends)\b', combined):
+        return "SURVIVAL_PERIOD"
+    if re.search(r'\b(?:convenience|without\s+cause)\b.*?\bnotice\b', combined) or re.search(r'\b(?:written\s+notice\s+of|notice\s+period)\b', combined):
+        return "NOTICE_PERIOD"
+    if re.search(r'\b(?:after\s+becoming\s+aware|upon\s+(?:written\s+)?request|after\s+(?:the\s+)?request|following\s+notice\s+of\s+breach|remedied\s+within|cure\s+period|after\s+an?\s+incident)\b', combined):
+        return "CONDITION_TRIGGERED_PERIOD"
+    if re.search(r'\b(?:during\s+(?:the\s+)?employment|term\s+of\s+\d+|project\s+period\s+is|estimated\s+period)\b', combined):
+        return "DURATION"
+    if re.search(r'\b(?:monthly|quarterly|annually|every\s+\d+\s+days?|recurring|in\s+advance)\b', combined):
+        return "RECURRING_FREQUENCY"
+    if re.search(r'\b(?:within\s+\d+|payable\s+within|due\s+within|no\s+later\s+than|test\s+it\s+and|feedback\s+within)\b', combined):
+        return "DEADLINE"
+    return "DEADLINE"
+
+
+def _extract_duration_number_and_unit(s: str) -> tuple[Optional[str], Optional[str]]:
+    clean_s = re.sub(r'\s+', ' ', s).strip()
+    num_m = re.search(r'\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|thirty|sixty|ninety)\b', clean_s, re.I)
+    word_to_num = {
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "fifteen": "15", "thirty": "30", "sixty": "60", "ninety": "90"
+    }
+    num_val = None
+    if num_m:
+        raw_n = num_m.group(1).lower()
+        num_val = word_to_num.get(raw_n, raw_n)
+    unit_m = re.search(r'(calendar\s+days?|business\s+days?|hours?|days?|weeks?|months?|years?)\b', clean_s, re.I)
+    unit_val = unit_m.group(1).lower() if unit_m else None
+    return num_val, unit_val
+
+
 # ─────────────────────────────────────────────────────────────
 # Main Entity Extraction Entry Point
 # ─────────────────────────────────────────────────────────────
@@ -341,10 +477,17 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
     structured_parties = _extract_structured_parties(chunks)
     party_names = [f"{p.name} — {p.role}" if p.role else p.name for p in structured_parties]
     if not party_names:
-        # Fallback to simple company name search
+        # Fallback to simple company name search (avoiding signatures, appendix, or multi-line titles)
         for c in chunks:
+            c_sec = str(getattr(c, "section", "")).upper()
+            if "SIGNATURE" in c_sec or "APPENDIX" in c_sec or "PREAMBLE" in c_sec:
+                continue
             for m in re.finditer(r'\b([A-Z][A-Za-z0-9\s\.\&\,\-]+?(?:Pvt\.?\s*Ltd\.?|Private Limited|Technologies|Solutions))\b', c.text):
                 name = m.group(1).strip()
+                if "\n" in name:
+                    name = name.split("\n")[-1].strip()
+                if any(bad in name.lower() for bad in ("signatures", "signature", "witness", "in witness", "appendix")):
+                    continue
                 if 5 < len(name) < 80 and name not in party_names:
                     party_names.append(name)
                     structured_parties.append(PartyDetail(name=name, role="Party", page=c.page))
@@ -372,27 +515,14 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
     structured_dates: list[DateDetail] = []
     seen_date_keys = set()
 
-    def _extract_duration_number_and_unit(s: str) -> tuple[Optional[str], Optional[str]]:
-        clean_s = re.sub(r'\s+', ' ', s).strip()
-        num_m = re.search(r'\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|thirty|sixty|ninety)\b', clean_s, re.I)
-        word_to_num = {
-            "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-            "fifteen": "15", "thirty": "30", "sixty": "60", "ninety": "90"
-        }
-        num_val = None
-        if num_m:
-            raw_n = num_m.group(1).lower()
-            num_val = word_to_num.get(raw_n, raw_n)
-        unit_m = re.search(r'(calendar\s+days?|business\s+days?|days?|weeks?|months?|years?)\b', clean_s, re.I)
-        unit_val = unit_m.group(1).lower() if unit_m else None
-        return num_val, unit_val
-
     for c in chunks:
         text = c.text
         pno = c.page
         sec = c.section
         sec_title = c.section_title or f"Section {sec}"
+        sec_str = str(sec or "").upper()
+        if "APPENDIX" in sec_str or "APPENDIX" in (sec_title or "").upper():
+            continue  # Do not extract contractual deadlines or dates from testing appendices
         if sec in ("SCHEDULE A", "SCHEDULE B"):
             clause_ref = "Schedule A (Milestones and Payment Plan)" if sec == "SCHEDULE A" else "Schedule B (Project Assumptions)"
         elif sec and sec != "PREAMBLE":
@@ -411,6 +541,7 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
                     seen_date_keys.add(key)
                     dtype = "EFFECTIVE_DATE" if ("effective" in text.lower() or sec == "1") else "DATE"
                     event_desc = "Agreement Effective Date" if dtype == "EFFECTIVE_DATE" else "Contractual Date"
+                    sem_cat = "EFFECTIVE_DATE" if dtype == "EFFECTIVE_DATE" else classify_temporal_semantics(clean_val, text)
                     structured_dates.append(DateDetail(
                         original_text=raw_val,
                         date_type=dtype,
@@ -424,6 +555,7 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
                         page=pno,
                         section=sec,
                         confidence=0.95,
+                        semantic_category=sem_cat,
                     ))
 
         # B. Durations & Relative periods parsed sentence by sentence
@@ -446,39 +578,68 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
                 event_desc = "Contractual Deadline"
                 resp_party = "Responsible Party"
 
-                # Precise semantic classification grounded in sentence context & section
-                if "schedule" in sent_lower or "project period" in sent_lower or sec == "4":
+                # Semantic classification based on sentence context (no hardcoded section numbers)
+                sec_title_lower = str(sec_title or "").lower()
+                if ("schedule" in sent_lower or "project period" in sent_lower
+                        or "project duration" in sec_title_lower):
                     dtype = "PROJECT_DURATION"
                     event_desc = "Project completion period"
                     resp_party = "Service Provider"
-                elif ("payable" in sent_lower or "invoice" in sent_lower) and "breach" not in sent_lower and sec != "14":
+                elif ("notif" in sent_lower
+                        and ("incident" in sent_lower or "security" in sent_lower or "loss" in sent_lower or "unauthorised" in sent_lower or "breach" in sent_lower)):
+                    dtype = "INCIDENT_NOTIFICATION"
+                    event_desc = "Security incident notification deadline"
+                    resp_party = "Receiving Party"
+                elif "return" in sent_lower and ("information" in sent_lower or "property" in sent_lower or "material" in sent_lower or "document" in sent_lower):
+                    dtype = "RETURN_DEADLINE"
+                    event_desc = "Return of confidential information deadline"
+                    resp_party = "Receiving Party"
+                elif ("delet" in sent_lower or "destroy" in sent_lower or "destruction" in sent_lower):
+                    dtype = "DELETION_DEADLINE"
+                    event_desc = "Deletion of confidential information deadline"
+                    resp_party = "Receiving Party"
+                elif (("surviv" in sent_lower or "continue" in sent_lower)
+                        and ("employment" in sent_lower or "terminat" in sent_lower or "expir" in sent_lower or "surviv" in sec_title_lower)):
+                    dtype = "SURVIVAL_PERIOD"
+                    event_desc = "Post-termination confidentiality survival period"
+                    resp_party = "Both Parties"
+                elif (("payable" in sent_lower or "invoice" in sent_lower)
+                        and "breach" not in sent_lower and "cure" not in sent_lower):
                     dtype = "PAYMENT_DEADLINE"
                     event_desc = "Invoice payment deadline"
                     resp_party = "Client"
-                elif "feedback" in sent_lower or "submission" in sent_lower or sec == "6":
+                elif "feedback" in sent_lower or ("submission" in sent_lower and "review" in sent_lower):
                     dtype = "CLIENT_FEEDBACK_PERIOD"
                     event_desc = "Client review and feedback period"
                     resp_party = "Client"
-                elif "acceptance" in sent_lower or "test" in sent_lower or "non-conform" in sent_lower or sec == "7":
+                elif "acceptance" in sent_lower or "non-conform" in sent_lower:
                     dtype = "ACCEPTANCE_PERIOD"
                     event_desc = "Acceptance testing and defect notification period"
                     resp_party = "Client"
-                elif ("breach" in sent_lower and ("remed" in sent_lower or "cure" in sent_lower)) or (sec == "14" and "material breach" in sent_lower):
+                elif "breach" in sent_lower and ("remed" in sent_lower or "cure" in sent_lower):
                     dtype = "CURE_PERIOD"
                     event_desc = "Material breach cure / remedy period"
                     resp_party = "Breaching Party"
-                elif ("convenience" in sent_lower or "termination" in sent_lower) and (sec == "14" or "written notice" in sent_lower):
+                elif ("convenience" in sent_lower or "without cause" in sent_lower) and "written notice" in sent_lower:
                     dtype = "NOTICE_PERIOD"
                     event_desc = "Termination for convenience notice"
                     resp_party = "Terminating Party"
-                elif ("dispute" in sent_lower and ("discuss" in sent_lower or "resolve" in sent_lower or "court" in sent_lower)) or sec == "16":
+                elif "terminat" in sent_lower and "notice" in sent_lower:
+                    dtype = "NOTICE_PERIOD"
+                    event_desc = "Termination notice period"
+                    resp_party = "Terminating Party"
+                elif (("change" in sent_lower or "changing" in sent_lower or "update" in sent_lower) and "address" in sent_lower):
+                    dtype = "NOTICE_UPDATE_PERIOD"
+                    event_desc = "Notice address update deadline"
+                    resp_party = "Either Party"
+                elif "dispute" in sent_lower and ("discuss" in sent_lower or "resolve" in sent_lower or "court" in sent_lower):
                     dtype = "DISPUTE_DISCUSSION_PERIOD"
                     event_desc = "Dispute resolution discussion period"
                     resp_party = "Both Parties"
-
                 key = (sec, dtype, clean_val)
                 if key not in seen_date_keys:
                     seen_date_keys.add(key)
+                    sem_cat = classify_temporal_semantics(clean_val, sent_clean)
                     structured_dates.append(DateDetail(
                         original_text=raw_val,
                         date_type=dtype,
@@ -492,6 +653,7 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
                         page=pno,
                         section=sec,
                         confidence=0.92,
+                        semantic_category=sem_cat,
                     ))
 
         # C. Milestones (Week 1, Week 4, Week 6)
@@ -515,6 +677,7 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
                     page=pno,
                     section=sec,
                     confidence=0.95,
+                    semantic_category="DEADLINE",
                 ))
 
     clean_date_strings = [
@@ -523,6 +686,42 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
         for d in structured_dates
     ]
 
+    # Dynamic jurisdiction & governing law extraction
+    _extracted_jurisdictions = []
+    _extracted_laws = []
+    _full_doc_text = " ".join(getattr(c, "text", "") for c in chunks if "APPENDIX" not in str(getattr(c, "section", "")).upper())
+
+    # Extract court jurisdiction phrases
+    for _jm in re.finditer(
+        r'(?i)(?:courts?(?:\s+having\s+competent\s+jurisdiction)?\s+(?:in|at|of)|jurisdiction\s+(?:in|at|of)|competent\s+courts?\s+(?:in|at|of))\s+([A-Z][A-Za-z\s,]+?)(?:\s+shall|\.|\n|;)',
+        _full_doc_text
+    ):
+        _jval = _jm.group(1).strip().rstrip(',')
+        if _jval and len(_jval) < 60 and _jval not in _extracted_jurisdictions:
+            _extracted_jurisdictions.append(_jval)
+
+    if not _extracted_jurisdictions:
+        for _jm in re.finditer(
+            r'(?i)jurisdiction\s+over\s+disputes.*?in\s+([A-Z][A-Za-z\s,]+?)(?:\.|\n|;)',
+            _full_doc_text
+        ):
+            _jval = _jm.group(1).strip().rstrip(',')
+            if _jval and len(_jval) < 60 and _jval not in _extracted_jurisdictions:
+                _extracted_jurisdictions.append(_jval)
+
+    # Extract governing law phrases
+    for _lm in re.finditer(
+        r'(?i)(?:governed\s+by\s+the\s+laws\s+of|governed\s+by\s+laws\s+of|laws\s+of|governed\s+by|applicable\s+law)\s+(?:the\s+)?([A-Z][A-Za-z\s]+?)(?:\.|\n|,|;)',
+        _full_doc_text
+    ):
+        _lval = _lm.group(1).strip()
+        if _lval and len(_lval) < 60 and _lval not in _extracted_laws:
+            _extracted_laws.append(_lval)
+
+    if not _extracted_jurisdictions:
+        _extracted_jurisdictions = ["Jurisdiction not specified in document"]
+    if not _extracted_laws:
+        _extracted_laws = ["Governing law not specified in document"]
     return NERResult(
         document_id=document_id,
         entities=all_entities,
@@ -533,8 +732,8 @@ def extract_entities(chunks: list, document_id: str, language_code: str = "en") 
         amounts=amount_strings,
         structured_finances=structured_finances,
         obligations=[],
-        jurisdictions=["Surat, Gujarat, India"],
-        laws=["Laws of India"],
+        jurisdictions=_extracted_jurisdictions,
+        laws=_extracted_laws,
         total_entities=len(structured_parties) + len(structured_finances) + len(structured_dates),
         stats={"parties": len(structured_parties), "finances": len(structured_finances), "dates": len(structured_dates)},
     )

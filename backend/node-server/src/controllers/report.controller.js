@@ -3,7 +3,7 @@
 const reportService = require('../services/report.service');
 const fs = require('fs');
 
-exports.generateReport = async (req, res, next) => {
+exports.generateReport = async function generateReport(req, res, next) {
   try {
     const { id } = req.params;
     const result = await reportService.generateDocumentReport(id, req.user._id);
@@ -45,7 +45,13 @@ exports.downloadReport = async (req, res, next) => {
     const report = await reportService.downloadReport(id, req.user._id);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="legalmind-report-${id}.pdf"`);
-    fs.createReadStream(report.filePath).pipe(res);
+    const stream = fs.createReadStream(report.filePath);
+    stream.on('error', (streamErr) => {
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: { message: 'Failed to read report file.' } });
+      }
+    });
+    stream.pipe(res);
   } catch (err) {
     if (err.status) return res.status(err.status).json({ success: false, error: { message: err.message } });
     next(err);

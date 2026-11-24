@@ -287,6 +287,7 @@ export default function IntelligenceWorkspacePane({
                 {metadata.pageCount && (
                   <span className="badge badge-neutral text-mono">
                     {metadata.pageCount} {metadata.pageCount === 1 ? 'PAGE' : 'PAGES'}
+                    {metadata.pageCountIsEstimated ? ' (EST.)' : ''}
                   </span>
                 )}
                 {metadata.wordCount && (

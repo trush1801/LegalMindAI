@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     FASTAPI_PORT:     int = 8000
     INTERNAL_API_KEY: str = "internal_secret_key_change_this"
     GEMINI_API_KEY:   str = ""
+    GEMINI_MODEL:     str = "gemini-2.0-flash"
+    FAISS_CACHE_MAX_SIZE: int = 20
     FAISS_INDEX_PATH: str = str(
         Path(__file__).resolve().parents[3] / "faiss_indexes"
     )

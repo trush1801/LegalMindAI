@@ -86,7 +86,9 @@ export const documentAPI = {
     }),
   remove: (id) => api.delete(`/documents/${id}`),
   getFile: (id) => api.get(`/documents/${id}/file`, { responseType: 'blob' }),
-  getChatHistory: (id) => api.get(`/documents/${id}/chat-history`),
+  getChatHistory: (id) => api.get(`/documents/${id}/chat`),
+  chat: (id, question) =>
+    api.post(`/documents/${id}/chat`, { query: question, question }),
   getVersions: (id) => api.get(`/documents/${id}/versions`),
   uploadVersion: (id, formData) =>
     api.post(`/documents/${id}/versions`, formData, {
@@ -107,10 +109,6 @@ export const documentAPI = {
 
 /* ——— Analysis / AI (via Express → FastAPI) ——— */
 export const analysisAPI = {
-  // These paths mirror whatever Express exposes from Parts 08–12.
-  // Phase 3 will wire exact panel data; safe placeholders kept here.
-  getAnalysis: (id) => api.get(`/documents/${id}/analysis`),
-  getRisk: (id) => api.get(`/documents/${id}/risk`),
   query: (id, question) =>
     api.post(`/documents/${id}/chat`, { query: question, question }),
 };

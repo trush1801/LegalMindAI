@@ -395,7 +395,7 @@ const getChatHistory = async (req, res, next) => {
       success: true,
       data: {
         messages: chat?.messages || [],
-        totalMessages: chat?.totalMessages || 0,
+        totalMessages: chat?.totalMessages != null ? chat.totalMessages : (chat?.messages?.length || 0),
       },
     });
   } catch (err) {
@@ -814,9 +814,11 @@ const getUserActivityFeedHandler = async (req, res) => {
 const getUpcomingUserObligationsHandler = async (req, res) => {
   try {
     const upcoming = await getUpcomingUserObligations(req.user._id);
+    const obligations = Array.isArray(upcoming) ? upcoming : (upcoming.obligations || []);
+    const processingCount = upcoming.processingCount || 0;
     res.status(200).json({
       success: true,
-      data: { obligations: upcoming },
+      data: { obligations, processingCount },
     });
   } catch (error) {
     console.error('Get upcoming user obligations error:', error);

@@ -14,6 +14,7 @@ Key improvements in v2:
 """
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -43,16 +44,18 @@ class TextChunk:
 
 @dataclass
 class ExtractionResult:
-    document_id:       str
-    file_format:       str
-    extraction_method: str
-    total_pages:       int
-    total_chunks:      int
-    total_words:       int
-    total_chars:       int
-    raw_word_count:    int = 0
-    chunks:            list[TextChunk] = field(default_factory=list)
-    warnings:          list[str]       = field(default_factory=list)
+    document_id:             str
+    file_format:             str
+    extraction_method:       str
+    total_pages:             int
+    total_chunks:            int
+    total_words:             int
+    total_chars:             int
+    raw_word_count:          int = 0
+    estimated_page_count:    int = 0
+    page_count_is_estimated: bool = False
+    chunks:                  list[TextChunk] = field(default_factory=list)
+    warnings:                list[str]       = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -63,7 +66,7 @@ class ExtractionResult:
 # ─────────────────────────────────────────────────────────────
 
 TOP_SECTION_RE = re.compile(
-    r'(?m)^(?P<sec_num>\d{1,2}\.|ARTICLE\s+[IVX\d]+|SCHEDULE\s+[A-Z]|ANNEXURE\s+[A-Z]|EXHIBIT\s+[A-Z])\s+(?P<sec_title>[^\n]+)'
+    r'(?m)^(?P<sec_num>\d{1,2}\.|ARTICLE\s+[IVX\d]+|SCHEDULE\s+[A-Z]|ANNEXURE\s+[A-Z]|EXHIBIT\s+[A-Z]|APPENDIX\s+[A-Z])\s+(?P<sec_title>[^\n]+)'
 )
 
 
@@ -94,8 +97,8 @@ def _extract_pdf_pymupdf(
     file_path: Path,
     document_id: str,
 ) -> tuple[list[TextChunk], int, list[str], set[int]]:
-    # pyrefly: ignore [missing-import]
-    import fitz
+    # Modern PyMuPDF import (PyMuPDF >= 1.24) with backwards-compatible alias
+    import pymupdf as fitz
 
     chunks: list[TextChunk] = []
     warnings: list[str] = []
@@ -233,8 +236,8 @@ def _extract_pages_easyocr(
     detected_language: str,
     start_chunk_index: int,
 ) -> tuple[list[TextChunk], list[str]]:
-    # pyrefly: ignore [missing-import]
-    import fitz
+    # Modern PyMuPDF import (PyMuPDF >= 1.24) with backwards-compatible alias
+    import pymupdf as fitz
     import easyocr
 
     chunks: list[TextChunk] = []
@@ -274,65 +277,99 @@ def _extract_pages_easyocr(
     return chunks, warnings
 
 
-def _extract_docx(file_path: Path, document_id: str) -> tuple[list[TextChunk], int, list[str]]:
+def _extract_docx(file_path: Path, document_id: str) -> tuple[list[TextChunk], int, list[str], bool]:
     import docx
 
     chunks: list[TextChunk] = []
     warnings: list[str] = []
     chunk_index = 0
+    total_pages = 1
+    page_count_is_estimated = True
 
     try:
         doc = docx.Document(str(file_path))
         full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        total_words = len(full_text.split())
+
+        # Check explicit page breaks in docx xml
+        explicit_breaks = 0
+        for p in doc.paragraphs:
+            if hasattr(p, "_p") and p._p is not None and getattr(p._p, "xml", None):
+                if 'w:type="page"' in p._p.xml or "w:lastRenderedPageBreak" in p._p.xml:
+                    explicit_breaks += 1
+
+        # Typography estimation: standard legal/contract page is ~450 words
+        word_based_pages = max(1, math.ceil(total_words / 450)) if total_words > 0 else (1 if full_text.strip() else 0)
+        total_pages = max(explicit_breaks + 1, word_based_pages)
 
         # Split on section headings if present
         matches = list(TOP_SECTION_RE.finditer(full_text))
+        running_words = 0
         if matches:
             if matches[0].start() > 0:
                 pre = full_text[:matches[0].start()].strip()
                 if pre:
-                    chunks.append(TextChunk(document_id, chunk_index, 1, "PREAMBLE", "Preamble", pre, len(pre), len(pre.split()), "docx"))
+                    pre_words = len(pre.split())
+                    chunk_page = min(total_pages, max(1, math.ceil((running_words + 1) / 450)))
+                    running_words += pre_words
+                    chunks.append(TextChunk(document_id, chunk_index, chunk_page, "PREAMBLE", "Preamble", pre, len(pre), pre_words, "docx"))
                     chunk_index += 1
             for i, m in enumerate(matches):
                 start = m.start()
                 end = matches[i+1].start() if i+1 < len(matches) else len(full_text)
                 txt = full_text[start:end].strip()
-                chunks.append(TextChunk(document_id, chunk_index, 1, m.group("sec_num").rstrip("."), m.group("sec_title").strip(), txt, len(txt), len(txt.split()), "docx"))
+                txt_words = len(txt.split())
+                chunk_page = min(total_pages, max(1, math.ceil((running_words + 1) / 450)))
+                running_words += txt_words
+                chunks.append(TextChunk(document_id, chunk_index, chunk_page, m.group("sec_num").rstrip("."), m.group("sec_title").strip(), txt, len(txt), txt_words, "docx"))
                 chunk_index += 1
         else:
-            chunks.append(TextChunk(document_id, 0, 1, None, None, full_text, len(full_text), len(full_text.split()), "docx"))
+            chunks.append(TextChunk(document_id, 0, 1, None, None, full_text, len(full_text), total_words, "docx"))
     except Exception as e:
         warnings.append(f"DOCX extraction error: {str(e)}")
 
-    return chunks, 1, warnings
+    return chunks, total_pages, warnings, page_count_is_estimated
 
 
-def _extract_txt(file_path: Path, document_id: str) -> tuple[list[TextChunk], int, list[str]]:
+def _extract_txt(file_path: Path, document_id: str) -> tuple[list[TextChunk], int, list[str], bool]:
     chunks: list[TextChunk] = []
     warnings: list[str] = []
+    total_pages = 1
+    page_count_is_estimated = True
 
     try:
         text = file_path.read_text(encoding="utf-8", errors="replace").strip()
+        total_words = len(text.split())
+        # Estimation rule: ~450 words per standard page
+        total_pages = max(1, math.ceil(total_words / 450)) if total_words > 0 else (1 if text else 0)
+
         matches = list(TOP_SECTION_RE.finditer(text))
         chunk_index = 0
+        running_words = 0
         if matches:
             if matches[0].start() > 0:
                 pre = text[:matches[0].start()].strip()
                 if pre:
-                    chunks.append(TextChunk(document_id, chunk_index, 1, "PREAMBLE", "Preamble", pre, len(pre), len(pre.split()), "txt"))
+                    pre_words = len(pre.split())
+                    chunk_page = min(total_pages, max(1, math.ceil((running_words + 1) / 450)))
+                    running_words += pre_words
+                    chunks.append(TextChunk(document_id, chunk_index, chunk_page, "PREAMBLE", "Preamble", pre, len(pre), pre_words, "txt"))
                     chunk_index += 1
             for i, m in enumerate(matches):
                 start = m.start()
                 end = matches[i+1].start() if i+1 < len(matches) else len(text)
                 txt = text[start:end].strip()
-                chunks.append(TextChunk(document_id, chunk_index, 1, m.group("sec_num").rstrip("."), m.group("sec_title").strip(), txt, len(txt), len(txt.split()), "txt"))
+                txt_words = len(txt.split())
+                chunk_page = min(total_pages, max(1, math.ceil((running_words + 1) / 450)))
+                running_words += txt_words
+                chunks.append(TextChunk(document_id, chunk_index, chunk_page, m.group("sec_num").rstrip("."), m.group("sec_title").strip(), txt, len(txt), txt_words, "txt"))
                 chunk_index += 1
         else:
-            chunks.append(TextChunk(document_id, 0, 1, None, None, text, len(text), len(text.split()), "txt"))
+            chunks.append(TextChunk(document_id, 0, 1, None, None, text, len(text), total_words, "txt"))
     except Exception as e:
         warnings.append(f"TXT extraction error: {str(e)}")
 
-    return chunks, 1, warnings
+    return chunks, total_pages, warnings, page_count_is_estimated
 
 
 # ─────────────────────────────────────────────────────────────
@@ -358,12 +395,14 @@ def extract_text(
     total_pages = 0
     raw_word_count = 0
     primary_method = fmt
+    page_count_is_estimated = False
 
     if fmt == "pdf":
         pymupdf_chunks, total_pages, pymupdf_warnings, scanned_pages, raw_word_count = _extract_pdf_pymupdf(file_path, document_id)
         chunks.extend(pymupdf_chunks)
         warnings.extend(pymupdf_warnings)
         primary_method = "pymupdf"
+        page_count_is_estimated = False
 
         if scanned_pages:
             ocr_chunks, ocr_warnings = _extract_pages_easyocr(
@@ -378,11 +417,11 @@ def extract_text(
             primary_method = "pymupdf+easyocr" if ocr_chunks else "pymupdf"
 
     elif fmt == "docx":
-        chunks, total_pages, warnings = _extract_docx(file_path, document_id)
+        chunks, total_pages, warnings, page_count_is_estimated = _extract_docx(file_path, document_id)
         primary_method = "docx"
 
     elif fmt == "txt":
-        chunks, total_pages, warnings = _extract_txt(file_path, document_id)
+        chunks, total_pages, warnings, page_count_is_estimated = _extract_txt(file_path, document_id)
         primary_method = "txt"
 
     else:
@@ -396,7 +435,7 @@ def extract_text(
 
     logger.info(
         f"Extraction complete: {len(chunks)} section chunks | "
-        f"{total_pages} pages | {total_words} words | method={primary_method}"
+        f"{total_pages} pages (estimated={page_count_is_estimated}) | {total_words} words | method={primary_method}"
     )
 
     return ExtractionResult(
@@ -404,6 +443,8 @@ def extract_text(
         file_format=fmt,
         extraction_method=primary_method,
         total_pages=total_pages,
+        estimated_page_count=total_pages,
+        page_count_is_estimated=page_count_is_estimated,
         total_chunks=len(chunks),
         total_words=total_words,
         total_chars=total_chars,

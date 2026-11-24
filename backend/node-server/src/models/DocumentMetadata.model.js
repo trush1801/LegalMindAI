@@ -19,8 +19,10 @@ const DocumentMetadataSchema = new mongoose.Schema(
     },
 
     // ── Extraction counts (Part 06) ─────────────────────────
-    pageCount:      { type: Number, default: 0 },
-    wordCount:      { type: Number, default: 0 },
+    pageCount:             { type: Number,  default: 0 },
+    estimatedPageCount:    { type: Number,  default: null },
+    pageCountIsEstimated:  { type: Boolean, default: false },
+    wordCount:             { type: Number,  default: 0 },
     rawWordCount:   { type: Number, default: null },
     characterCount: { type: Number, default: 0 },
     chunkCount:     { type: Number, default: 0 },
@@ -39,7 +41,8 @@ const DocumentMetadataSchema = new mongoose.Schema(
     extractionMethod: { type: String, default: null },
 
     extractedAt:   { type: Date,   default: null },
-    extractedText: { type: String, default: null }, // chunk preview/summary
+    extractedText: { type: String, default: null }, // Full extracted text (ERR-DATA-001)
+    plainSummary:  { type: String, default: null }, // Plain language summary (ERR-DATA-001)
 
     // ── Document dates ──────────────────────────────────────
     documentDate:  { type: Date, default: null },

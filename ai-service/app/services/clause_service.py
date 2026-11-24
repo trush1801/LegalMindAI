@@ -774,7 +774,7 @@ def extract_clauses(
 
         # Specific structural & schedule overrides
         is_preamble = (str(section or "").upper() == "PREAMBLE") or (stitle and "preamble" in stitle.lower())
-        is_schedule = bool(section and str(section).upper().startswith("SCHEDULE"))
+        is_schedule = bool(section and (str(section).upper().startswith("SCHEDULE") or str(section).upper().startswith("APPENDIX")))
 
         if is_preamble:
             best_type = "preamble"
@@ -796,6 +796,9 @@ def extract_clauses(
             elif "SCHEDULE B" in sec_upper or "SCHEDULE B" in st_upper:
                 clause_name = "Schedule B — Sample Project Assumptions"
                 stitle = "SCHEDULE B — SAMPLE PROJECT ASSUMPTIONS"
+            elif "APPENDIX" in sec_upper or "APPENDIX" in st_upper:
+                clean_st = stitle.lstrip('–- ').strip() if stitle else ""
+                clause_name = f"{section} — {clean_st}" if clean_st else f"Appendix {section}"
             else:
                 clause_name = f"Schedule {section}"
             legal_significance = "INFORMATIONAL"
@@ -882,24 +885,22 @@ def extract_clauses(
 # Missing & Incomplete Provisions Analysis (Part 08B / Audit)
 # ─────────────────────────────────────────────────────────────
 
-def evaluate_missing_provisions(clauses: list, doc_type: str = "software_development_agreement") -> list[dict]:
+def evaluate_missing_provisions(clauses: list, doc_type: str = "generic_contract") -> list[dict]:
     """
-    Evaluate 9 key software agreement provisions:
-      1. Post-handover warranty
-      2. Maintenance and support
-      3. Force majeure
-      4. Security incident notification
-      5. Backup & data deletion
-      6. Source code handover
-      7. Third-party licensing
-      8. Confidentiality survival
-      9. Dispute resolution procedure
+    Evaluate missing/incomplete provisions using CATEGORY-SPECIFIC benchmarks.
 
-    Classifies each as PRESENT, PARTIALLY_PRESENT, or MISSING.
-    Enforces evidence structure:
-      provision_name, status, actual_section_number, actual_section_heading,
-      supporting_text, missing_elements, commercial_significance, recommendation.
+    Dispatches to the appropriate evaluation function based on document type:
+      - Employment NDA / Confidentiality   → _eval_employment_nda_provisions()
+      - Software Development Agreement     → _eval_sdsa_provisions()
+      - Employment Contract & Covenants    → _eval_employment_provisions()
+      - Property / Commercial Lease        → _eval_property_lease_provisions()
+      - General / Other                    → _eval_generic_provisions()
+
+    Never applies software development benchmarks to Employment NDAs or other categories.
     """
+    doc_type_lower = (doc_type or "").lower()
+
+    # Build lookup maps from provided clauses (shared by all evaluators)
     clause_by_sec: dict[str, dict] = {}
     clause_by_type: dict[str, dict] = {}
     combined_text = ""
@@ -907,397 +908,790 @@ def evaluate_missing_provisions(clauses: list, doc_type: str = "software_develop
     for c in clauses:
         c_dict = c if isinstance(c, dict) else c.to_dict() if hasattr(c, "to_dict") else asdict(c)
         ctype = c_dict.get("clause_type")
-        csec = str(c_dict.get("section") or "")
+        csec  = str(c_dict.get("section") or "")
         ctext = c_dict.get("text") or ""
         if ctype:
             clause_by_type[ctype] = c_dict
         if csec:
-            clause_by_sec[csec] = c_dict
+            clause_by_sec[csec]   = c_dict
         combined_text += " " + ctext.lower()
 
-    evaluations: list[dict] = []
+    ctx = {
+        "clause_by_sec":  clause_by_sec,
+        "clause_by_type": clause_by_type,
+        "combined_text":  combined_text,
+        "clauses":        clauses,
+    }
+
+    # Route to category-specific evaluator
+    if any(kw in doc_type_lower for kw in (
+        "nda", "non-disclosure", "confidentiality", "employment nda",
+        "non disclosure agreement"
+    )):
+        logger.info(f"Missing provisions: routing to Employment NDA evaluator (doc_type={doc_type!r})")
+        return _eval_employment_nda_provisions(ctx)
+
+    if any(kw in doc_type_lower for kw in (
+        "software development", "software development services", "development services",
+        "services agreement", "master services", "consulting", "vendor"
+    )):
+        logger.info(f"Missing provisions: routing to SDSA evaluator (doc_type={doc_type!r})")
+        return _eval_sdsa_provisions(ctx)
+
+    if any(kw in doc_type_lower for kw in (
+        "employment", "employment agreement", "employment contract", "offer letter", "appointment letter",
+        "severance", "labor", "hr", "executive"
+    )):
+        logger.info(f"Missing provisions: routing to Employment Agreement evaluator (doc_type={doc_type!r})")
+        return _eval_employment_provisions(ctx)
+
+    if any(kw in doc_type_lower for kw in (
+        "lease", "property", "tenancy", "rental", "commercial lease",
+        "residential", "landlord", "tenant"
+    )):
+        logger.info(f"Missing provisions: routing to Property Lease evaluator (doc_type={doc_type!r})")
+        return _eval_property_lease_provisions(ctx)
+
+    if any(kw in doc_type_lower for kw in (
+        "loan", "credit", "financing", "borrowing", "promissory note",
+        "facility agreement", "debt", "commercial loan"
+    )):
+        logger.info(f"Missing provisions: routing to Loan & Financing evaluator (doc_type={doc_type!r})")
+        return _eval_loan_provisions(ctx)
+
+    logger.info(f"Missing provisions: routing to generic evaluator (doc_type={doc_type!r})")
+    return _eval_generic_provisions(ctx)
+
+
+def _has_clause(clause_by_type: dict, clause_by_sec: dict, combined_text: str,
+                type_keys: list = [], sec_keys: list = [], text_signals: list = [],
+                clauses: list = []) -> tuple[bool, dict]:
+    """Helper: check if a provision exists. Returns (found, clause_dict)."""
+    # 1. Match by specific section key first
+    for s in sec_keys:
+        if s in clause_by_sec:
+            return True, clause_by_sec[s]
+
+    # 2. Match by clause text/title scanning through all clauses
+    for c in clauses:
+        c_dict = c if isinstance(c, dict) else c.to_dict() if hasattr(c, "to_dict") else asdict(c)
+        ctitle = (c_dict.get("section_title") or "").lower()
+        ctext = (c_dict.get("text") or "").lower()
+        ctype = c_dict.get("clause_type")
+
+        # Skip appendix/notes
+        if "appendix" in ctitle or "appendix" in str(c_dict.get("section", "")).lower():
+            continue
+
+        for sig in text_signals:
+            sig_esc = re.escape(sig.lower())
+            if sig.lower() in ctitle or re.search(r'\b' + sig_esc + r'\b', ctext):
+                return True, c_dict
+
+        if ctype and ctype in type_keys:
+            return True, c_dict
+
+    # 3. Fallback to combined text
+    for sig in text_signals:
+        sig_esc = re.escape(sig.lower())
+        if re.search(r'\b' + sig_esc + r'\b', combined_text):
+            return True, {}
+    return False, {}
+
+
+def _eval_employment_nda_provisions(ctx: dict) -> list[dict]:
+    """
+    Evaluate missing provisions for Employment NDA / Confidentiality Agreement.
+    Benchmarks:
+      1. Confidential Information Definition
+      2. Permitted Disclosure Exceptions
+      3. Information Security Obligations
+      4. Personal Data / Privacy Compliance
+      5. Return and Deletion of Confidential Information
+      6. Post-termination Survival Period
+      7. Remedies for Breach (Injunctive Relief)
+      8. Governing Law & Jurisdiction
+      9. Non-compete / Non-solicitation
+     10. Dispute Resolution
+    """
+    cb_sec  = ctx["clause_by_sec"]
+    cb_type = ctx["clause_by_type"]
+    text    = ctx["combined_text"]
+    clauses = ctx.get("clauses", [])
+    evals   = []
+
+    # 1. Confidential Information Definition
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["definition"],
+        sec_keys=["3"],
+        text_signals=["definition of confidential information", "confidential information means", "confidential information includes"],
+        clauses=clauses)
+    evals.append({
+        "id": "confidential_information_definition",
+        "provision_name": "Confidential Information Definition",
+        "name": "Confidential Information Definition",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Definition of Confidential Information", "Scope and categories"],
+        "details": "Confidential information is defined in the agreement." if found else
+                   "Agreement lacks a clear definition of what constitutes confidential information.",
+        "commercial_significance": "A precise definition limits disputes about which information is protected.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Without a clear definition, enforcement of the NDA may be challenged.",
+        "recommendation": "Define confidential information by category (business plans, technical data, personnel records, etc.)." if not found else "",
+    })
+
+    # 2. Permitted Disclosure Exceptions / Exclusions
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["confidentiality"],
+        sec_keys=["6", "4"],
+        text_signals=["permitted and required disclosure", "exclusions", "publicly available", "publicly known", "required by law"],
+        clauses=clauses)
+    evals.append({
+        "id": "disclosure_exceptions",
+        "provision_name": "Permitted Disclosure Exceptions",
+        "name": "Permitted Disclosure Exceptions",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Carve-out for publicly available information", "Carve-out for legally compelled disclosure"],
+        "details": "Agreement includes standard disclosure exceptions." if found else
+                   "Agreement should specify permitted disclosure exceptions to avoid overbreadth challenges.",
+        "commercial_significance": "Standard exclusions protect the recipient from liability for information already public.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "Overly broad NDAs without exclusions may be unenforceable.",
+        "recommendation": "Include standard exclusions: publicly available, independently developed, required by law, already known." if not found else "",
+    })
+
+    # 3. Information Security Obligations
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["data_protection"],
+        sec_keys=["7"],
+        text_signals=["information security and incident reporting", "information security", "incident reporting", "security procedures"],
+        clauses=clauses)
+    evals.append({
+        "id": "information_security",
+        "provision_name": "Information Security Obligations",
+        "name": "Information Security Obligations",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Minimum security standard", "Incident notification obligation"],
+        "details": "Security obligations and incident reporting are addressed." if found else
+                   "Agreement should specify the standard of care required to protect confidential information.",
+        "commercial_significance": "Specifying security standards prevents disputes about whether adequate protection was applied.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Vague security standards leave the company exposed to inadequate protection claims.",
+        "recommendation": "Specify 'reasonable technical and organisational measures' and require incident notification within a defined period (e.g., 48 hours)." if not found else "",
+    })
+
+    # 4. Personal Data / Privacy Compliance
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["data_protection"],
+        sec_keys=["8"],
+        text_signals=["personal data", "data-protection", "privacy compliance"],
+        clauses=clauses)
+    evals.append({
+        "id": "personal_data_compliance",
+        "provision_name": "Personal Data & Privacy Compliance",
+        "name": "Personal Data & Privacy Compliance",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Personal data processing obligations", "Applicable data protection law reference"],
+        "details": "Personal data obligations are addressed." if found else
+                   "Agreement does not specifically address personal data accessed during employment.",
+        "commercial_significance": "Employee NDAs often cover personal data about clients, colleagues, and business contacts.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "Personal data obligations may apply under applicable law regardless of contractual silence.",
+        "recommendation": "Include a provision requiring compliance with applicable data protection laws for any personal data accessed during employment." if not found else "",
+    })
+
+    # 5. Return / Deletion of Confidential Information
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["confidentiality"],
+        sec_keys=["10"],
+        text_signals=["return and deletion of information", "return and deletion", "stop using confidential information and return"],
+        clauses=clauses)
+    evals.append({
+        "id": "return_deletion",
+        "provision_name": "Return and Deletion of Confidential Information",
+        "name": "Return and Deletion of Confidential Information",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Return deadline", "Deletion certification requirement"],
+        "details": "Return and deletion obligations are present." if found else
+                   "Agreement should specify obligations to return or destroy confidential information upon termination.",
+        "commercial_significance": "Without return/deletion obligations, confidential data may remain with former employees indefinitely.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Failure to retrieve confidential information upon termination exposes trade secrets.",
+        "recommendation": "Specify deadlines for return (e.g., 7 calendar days) and deletion (e.g., 10 calendar days) with written certification." if not found else "",
+    })
+
+    # 6. Post-termination Survival Period
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["survival"],
+        sec_keys=["11"],
+        text_signals=["term and survival", "confidentiality obligations continue for", "survival"],
+        clauses=clauses)
+    evals.append({
+        "id": "confidentiality_survival",
+        "provision_name": "Post-termination Confidentiality Survival",
+        "name": "Post-termination Confidentiality Survival",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Explicit survival clause", "Survival duration"],
+        "details": "Agreement includes post-termination survival provisions." if found else
+                   "Agreement does not specify how long confidentiality obligations survive termination.",
+        "commercial_significance": "Without a survival clause, confidentiality obligations may lapse upon employment termination.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Trade secrets and business-sensitive information may become unprotected after the employment ends.",
+        "recommendation": "Add explicit survival clause specifying duration (e.g., 3 years post-termination; indefinitely for trade secrets)." if not found else "",
+    })
+
+    # 7. Remedies for Breach (Injunctive Relief vs Complete Framework)
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["liability"],
+        sec_keys=["13"],
+        text_signals=["remedies and liability", "injunctive or equitable relief", "remedies"],
+        clauses=clauses)
+    evals.append({
+        "id": "breach_remedies",
+        "provision_name": "Remedies for Breach",
+        "name": "Remedies for Breach",
+        "status": "PARTIALLY_PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": ["Material breach cure period", "Liquidated damages formula or indemnity framework"],
+        "details": "Agreement provides for injunctive and equitable relief in Section 13, but lacks a contractual damages framework or breach cure mechanism." if found else
+                   "Agreement does not specify remedies available for breach of confidentiality.",
+        "commercial_significance": "Injunctive relief is critical for NDAs because damages may be impossible to quantify.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Without a damages framework or cure period, remedies are limited to discretionary court injunctions.",
+        "recommendation": "Supplement injunctive relief with an express indemnity or damages framework and a defined cure period for curable breaches." if found else "",
+    })
+
+    # 8. Governing Law & Jurisdiction
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["governing_law"],
+        sec_keys=["15"],
+        text_signals=["governing law and jurisdiction", "governing law", "jurisdiction over disputes"],
+        clauses=clauses)
+    evals.append({
+        "id": "governing_law",
+        "provision_name": "Governing Law & Jurisdiction",
+        "name": "Governing Law & Jurisdiction",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Applicable law clause", "Jurisdiction clause"],
+        "details": "Governing law is specified in the agreement." if found else
+                   "Agreement does not specify the governing law or jurisdiction for disputes.",
+        "commercial_significance": "Without a governing law clause, disputes may be subject to unpredictable choice-of-law rules.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "Jurisdictional ambiguity increases litigation costs and risk.",
+        "recommendation": "Specify governing law and exclusive jurisdiction for disputes." if not found else "",
+    })
+
+    # 9. Non-compete / Future Employment & Non-solicitation
+    # Note: Confirming no restriction on future employment (Section 12) does NOT establish an affirmative non-solicitation clause.
+    has_restrictive_covenant, rc_clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["non_compete"],
+        text_signals=["shall not compete", "non-solicitation of clients", "non-solicitation of employees", "covenant not to compete"],
+        clauses=clauses)
+    if has_restrictive_covenant and re.search(r'\b(?:does\s+not\s+prohibit|no\s+restriction)\b', rc_clause.get("text", ""), re.I):
+        has_restrictive_covenant = False
+
+    evals.append({
+        "id": "non_compete",
+        "provision_name": "Non-compete & Non-solicitation Restrictions",
+        "name": "Non-compete & Non-solicitation Restrictions",
+        "status": "PRESENT" if has_restrictive_covenant else "MISSING",
+        "actual_section_number": rc_clause.get("section") if has_restrictive_covenant else None,
+        "actual_section_heading": rc_clause.get("section_title") if has_restrictive_covenant else None,
+        "clause_reference": f"Section {rc_clause.get('section')} ({rc_clause.get('section_title')})" if has_restrictive_covenant else "None",
+        "supporting_text": rc_clause.get("text", "")[:350] if has_restrictive_covenant else "",
+        "missing_elements": [] if has_restrictive_covenant else ["Non-solicitation of clients/customers", "Non-solicitation of employees/co-workers"],
+        "details": "Restrictive covenants and non-solicitation terms are present." if has_restrictive_covenant else
+                   "Agreement does not contain non-compete or non-solicitation covenants; Section 12 explicitly confirms no post-employment restraint on future employment.",
+        "commercial_significance": "Non-solicitation covenants protect business relationships and prevent team poaching post-employment.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "In India, post-employment non-compete restraints are void under Section 27 of the Indian Contract Act, but reasonable non-solicitation covenants may be enforceable.",
+        "recommendation": "If commercial protection is desired, consider adding distinct client and employee non-solicitation covenants compliant with applicable employment law." if not has_restrictive_covenant else "",
+    })
+
+    # 10. Dispute Resolution Procedure
+    # Note: Governing law and jurisdiction (Section 15) does NOT establish an ADR/arbitration/negotiation procedure.
+    has_adr, adr_clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["dispute_resolution"],
+        text_signals=["good-faith negotiation", "mediation", "arbitration protocol", "binding arbitration", "escalation procedure"],
+        clauses=clauses)
+    evals.append({
+        "id": "dispute_resolution",
+        "provision_name": "Dispute Resolution Procedure",
+        "name": "Dispute Resolution Procedure",
+        "status": "PRESENT" if has_adr else "MISSING",
+        "actual_section_number": adr_clause.get("section") if has_adr else None,
+        "actual_section_heading": adr_clause.get("section_title") if has_adr else None,
+        "clause_reference": f"Section {adr_clause.get('section')} ({adr_clause.get('section_title')})" if has_adr else "None",
+        "supporting_text": adr_clause.get("text", "")[:350] if has_adr else "",
+        "missing_elements": [] if has_adr else ["Informal good-faith negotiation window", "Mediation procedure", "Binding arbitration protocol"],
+        "details": "Dispute resolution and escalation procedures are structured in the agreement." if has_adr else
+                   "Agreement designates governing law and court jurisdiction (Section 15), but lacks an alternative dispute resolution (ADR), escalation, or mediation procedure.",
+        "commercial_significance": "A structured dispute resolution procedure prevents premature court litigation and facilitates amicable settlement.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "Without defined pre-litigation dispute mechanisms, any formal conflict proceeds directly to court litigation.",
+        "recommendation": "Include a tiered dispute resolution clause specifying informal negotiation (e.g., 15-30 days) and mediation or arbitration prior to initiating court litigation." if not has_adr else "",
+    })
+
+    return evals
+
+
+def _eval_sdsa_provisions(ctx: dict) -> list[dict]:
+    """
+    Evaluate missing provisions for Software Development Services Agreements.
+    Benchmarks:
+      1. Post-Handover Warranty & SLA
+      2. Maintenance and Support
+      3. Force Majeure
+      4. Security Incident Notification
+      5. Source Code Handover & Escrow
+      6. Third-party Licensing
+      7. Confidentiality Survival
+      8. Dispute Resolution
+    """
+    cb_sec  = ctx["clause_by_sec"]
+    cb_type = ctx["clause_by_type"]
+    text    = ctx["combined_text"]
+    clauses = ctx.get("clauses", [])
+    evals   = []
 
     # 1. Post-Handover Warranty & SLA
-    sec12_clause = clause_by_sec.get("12") or clause_by_type.get("warranties")
-    if sec12_clause:
-        s_text = sec12_clause.get("text", "")
-        evaluations.append({
-            "id": "post_handover_warranty",
-            "provision_name": "Post-Handover Warranty & SLA",
-            "name": "Post-Handover Warranty & SLA",
-            "status": "PARTIALLY_PRESENT",
-            "actual_section_number": "12",
-            "actual_section_heading": "Warranties and Disclaimers",
-            "clause_reference": "Section 12 (Warranties and Disclaimers)",
-            "supporting_text": s_text[:350].strip() if s_text else "The Service Provider warrants that it will perform the services with reasonable skill and care. Except as expressly stated in this Agreement, the services and deliverables are provided without any other warranty, whether express or implied... The Service Provider does not warrant that deliverables will be error-free or uninterrupted.",
-            "missing_elements": [
-                "Post-handover warranty defect remediation period",
-                "Bug-fixing response/resolution SLAs with severity tiers",
-                "Remediation of defects discovered during live operations post-acceptance",
-            ],
-            "details": "Section 12 provides an express warranty of reasonable skill and care, but expressly disclaims implied warranties and does not warrant error-free or uninterrupted operation. Lacks an ongoing post-handover warranty or bug-fixing SLA, shifting operational defect correction risks onto the Client post-delivery without guaranteed developer response times.",
-            "commercial_significance": "Section 12 warrants reasonable skill and care, but expressly disclaims implied warranties and error-free operation. Shifts long-term defect remediation and software maintenance operational risks onto the Client post-delivery without guaranteed developer response times.",
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["warranties"],
+        sec_keys=["12"],
+        text_signals=["warranty", "warrants", "skill and care"],
+        clauses=clauses)
+    evals.append({
+        "id": "post_handover_warranty",
+        "provision_name": "Post-Handover Warranty & SLA",
+        "name": "Post-Handover Warranty & SLA",
+        "status": "PARTIALLY_PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": ["Post-handover warranty defect remediation period",
+                             "Bug-fixing response/resolution SLAs with severity tiers"],
+        "details": "Warranty clause present but lacks defined post-handover bug-fix SLA." if found else
+                   "No warranty or SLA provision found.",
+        "commercial_significance": "Without a defined warranty period, the client has no guaranteed remediation for defects discovered after delivery.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Client bears full risk for post-delivery defects without a warranty cure period.",
+        "recommendation": "Negotiate an explicit post-handover warranty cure period (e.g., 30-60 days) for verified material non-conformities.",
+    })
+
+    # 2. Maintenance and Support
+    # Note: Distinguish affirmative maintenance agreements from negative disclaimers/exclusions (e.g. Schedule B)
+    maint_excluded = bool(re.search(r'\b(?:ongoing\s+maintenance.*?is\s+not\s+included|maintenance.*?excluded)\b', text, re.I))
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["maintenance"],
+        text_signals=["ongoing support agreement", "maintenance services agreement", "support sla"],
+        clauses=clauses)
+    if maint_excluded and not found:
+        # Maintenance is explicitly excluded in Schedule B, not affirmative
+        sch_b = cb_sec.get("SCHEDULE B", {})
+        evals.append({
+            "id": "maintenance_support",
+            "provision_name": "Ongoing Maintenance & Support",
+            "name": "Ongoing Maintenance & Support",
+            "status": "MISSING",
+            "actual_section_number": sch_b.get("section") if sch_b else None,
+            "actual_section_heading": sch_b.get("section_title") if sch_b else None,
+            "clause_reference": "Schedule B (PROJECT ASSUMPTIONS)",
+            "supporting_text": "Ongoing maintenance after the handover period is not included in the fixed project fee.",
+            "missing_elements": ["Post-handover maintenance agreement", "Support response/resolution SLAs", "Maintenance fee schedule"],
+            "details": "Ongoing maintenance after the handover period is expressly excluded under Schedule B; no post-handover support agreement or SLA is established.",
+            "commercial_significance": "Without maintenance terms, software may become non-functional without a remedy.",
             "significance": "HIGH",
-            "commercial_legal_impact": "Shifts long-term defect remediation and software maintenance operational risks onto the Client post-delivery without guaranteed developer response times.",
-            "recommendation": "Negotiate an explicit post-handover warranty cure period (e.g., 30–60 days) requiring developer to correct verified material non-conformities at zero additional fee before entering a paid maintenance contract.",
+            "commercial_legal_impact": "Client must negotiate post-delivery maintenance separately after delivery.",
+            "recommendation": "Include a maintenance and support annex specifying scope, response times, and pricing.",
         })
     else:
-        evaluations.append({
-            "id": "post_handover_warranty",
-            "provision_name": "Post-Handover Warranty & SLA",
-            "name": "Post-Handover Warranty & SLA",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": [
-                "Warranty of reasonable skill and care",
-                "Post-handover defect warranty period",
-                "Bug-fixing response/resolution SLAs",
-            ],
-            "details": "No express warranty clause or defect remediation commitments found in the agreement.",
-            "commercial_significance": "Client has no legal recourse for defects or operational failures post-handover.",
-            "significance": "CRITICAL",
-            "commercial_legal_impact": "Client has no legal recourse for defects or operational failures post-handover.",
-            "recommendation": "Incorporate a standard warranty provision and 60-day post-delivery warranty defect cure period.",
+        evals.append({
+            "id": "maintenance_support",
+            "provision_name": "Ongoing Maintenance & Support",
+            "name": "Ongoing Maintenance & Support",
+            "status": "PRESENT" if found else "MISSING",
+            "actual_section_number": clause.get("section") if found else None,
+            "actual_section_heading": clause.get("section_title") if found else None,
+            "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+            "supporting_text": clause.get("text", "")[:350] if found else "",
+            "missing_elements": [] if found else ["Maintenance scope", "Support response SLAs", "Pricing"],
+            "details": "Maintenance provisions are present." if found else
+                       "No ongoing maintenance or support provisions found.",
+            "commercial_significance": "Without maintenance terms, software may become non-functional without a remedy.",
+            "significance": "HIGH",
+            "commercial_legal_impact": "Client must negotiate post-delivery maintenance separately after delivery.",
+            "recommendation": "Include a maintenance and support annex specifying scope, response times, and pricing." if not found else "",
         })
 
-    # 2. Maintenance & Technical Support SLA
-    has_maintenance = "maintenance" in clause_by_type or any(
-        "maintenance" in (c.get("text", "")).lower() and "sla" in (c.get("text", "")).lower()
-        for c in clauses
-    )
-    if has_maintenance:
-        evaluations.append({
-            "id": "maintenance_and_support",
-            "provision_name": "Maintenance & Technical Support SLA",
-            "name": "Maintenance & Technical Support SLA",
-            "status": "PRESENT",
-            "actual_section_number": "Maintenance",
-            "actual_section_heading": "Maintenance and Support",
-            "clause_reference": "Maintenance & Support Clause",
-            "supporting_text": "Post-launch maintenance and technical support SLAs are defined.",
-            "missing_elements": [],
-            "details": "Post-launch maintenance and technical support SLAs are defined.",
-            "commercial_significance": "Guarantees ongoing operational support and patch management.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Guarantees ongoing operational support and patch management.",
-            "recommendation": "Maintain periodic reviews of SLA response and resolution performance.",
-        })
-    else:
-        evaluations.append({
-            "id": "maintenance_and_support",
-            "provision_name": "Maintenance & Technical Support SLA",
-            "name": "Maintenance & Technical Support SLA",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": [
-                "Ongoing post-launch technical support",
-                "Bug-fixing response/resolution SLAs",
-                "Patch management and compatibility updates",
-                "Helpdesk support hours and escalation pathways",
-            ],
-            "details": "The agreement contains zero provisions for ongoing technical support, bug fixing SLAs, patch management, or system upgrade commitments post-launch.",
-            "commercial_significance": "Leaves ongoing application maintenance, patch management, and server compatibility unaddressed, requiring separate renegotiations and consulting fees.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Leaves ongoing application maintenance, patch management, and server compatibility unaddressed, requiring separate renegotiations and consulting fees.",
-            "recommendation": "Execute a separate Software Maintenance & Support Agreement (SMA) or add a support schedule specifying service hours, ticket severity levels, and response/resolution SLAs.",
+    # 3. Force Majeure
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["force_majeure"],
+        text_signals=["force majeure", "act of god", "beyond control", "unforeseeable"],
+        clauses=clauses)
+    evals.append({
+        "id": "force_majeure",
+        "provision_name": "Force Majeure",
+        "name": "Force Majeure",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Force majeure definition", "Notification obligation", "Termination right"],
+        "details": "Force majeure is addressed." if found else
+                   "No force majeure clause found.",
+        "commercial_significance": "Without force majeure, delays from circumstances beyond a party's control may constitute breach.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "Either party may be liable for delays caused by unforeseeable events.",
+        "recommendation": "Add a force majeure clause covering natural disasters, pandemics, government actions, and similar events." if not found else "",
+    })
+
+    # 4. Security Incident Notification
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["data_protection"],
+        sec_keys=["11"],
+        text_signals=["security incident", "data breach", "incident reporting"],
+        clauses=clauses)
+    evals.append({
+        "id": "security_incident_notification",
+        "provision_name": "Security Incident Notification",
+        "name": "Security Incident Notification",
+        "status": "PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if found else ["Notification timeframe", "Remediation plan obligation"],
+        "details": "Security incident reporting is addressed." if found else
+                   "No security incident notification clause found.",
+        "commercial_significance": "Data breach notification is required under data privacy regulations.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Failure to report incidents exposes parties to regulatory penalties.",
+        "recommendation": "Add security incident notification obligations with a 48-72 hour notification deadline." if not found else "",
+    })
+
+    # 5. Source Code Handover & Escrow
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["intellectual_property"],
+        sec_keys=["3", "10"],
+        text_signals=["source code", "deliverables", "handover session"],
+        clauses=clauses)
+    evals.append({
+        "id": "source_code_handover",
+        "provision_name": "Source Code Handover & Escrow",
+        "name": "Source Code Handover & Escrow",
+        "status": "PARTIALLY_PRESENT" if found else "MISSING",
+        "actual_section_number": "3",
+        "actual_section_heading": "DELIVERABLES",
+        "clause_reference": "Section 3 (§3.1), Section 10 (INTELLECTUAL PROPERTY), Schedule A",
+        "supporting_text": "3.1 The Service Provider will provide: (b) source code for custom-developed components... and (f) one handover session of up to two hours.",
+        "missing_elements": ["Third-party source code escrow mechanism", "Escrow release condition triggers"],
+        "details": "Source code delivery and handover session are provided under Section 3.1, Section 10, and Schedule A upon full payment; however, no third-party source code escrow mechanism is established." if found else
+                   "No explicit source code delivery or escrow clause found.",
+        "commercial_significance": "Source code delivery ensures the client can maintain the software independently.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Without source code, the client faces vendor lock-in.",
+        "recommendation": "Specify that all custom source code, documentation, and build scripts are delivered to the client upon final payment, and consider an escrow mechanism for critical software." if not found else "",
+    })
+
+    # 6. Third-Party & Open-Source Licensing
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        sec_keys=["10"],
+        text_signals=["pre-existing materials", "third-party materials", "licence to use"],
+        clauses=clauses)
+    sec10 = cb_sec.get("10", {})
+    evals.append({
+        "id": "third_party_licensing",
+        "provision_name": "Third-party & Open-source Licensing",
+        "name": "Third-party & Open-source Licensing",
+        "status": "PARTIALLY_PRESENT" if found else "MISSING",
+        "actual_section_number": "10",
+        "actual_section_heading": "INTELLECTUAL PROPERTY",
+        "clause_reference": "Section 10 (INTELLECTUAL PROPERTY), Schedule B (PROJECT ASSUMPTIONS)",
+        "supporting_text": sec10.get("text", "")[:350] if sec10 else "Section 10 grants a perpetual licence to Pre-Existing Materials; Schedule B excludes third-party licences.",
+        "missing_elements": ["Open-source software disclosure", "Copyleft/GPL license compliance warranty"],
+        "details": "Section 10 grants a perpetual licence to Pre-Existing Materials, and Schedule B excludes third-party licences, but agreement lacks an open-source component disclosure and warranty." if found else
+                   "No third-party licensing or open-source disclosure clause found.",
+        "commercial_significance": "Undisclosed GPL or copyleft software creates copyright infringement and disclosure risks.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Incompatible licenses can force open-sourcing of proprietary software.",
+        "recommendation": "Include a provision requiring disclosure of open-source components and compliance with their licenses." if not found else "",
+    })
+
+    # 7. Confidentiality Survival
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["survival"],
+        sec_keys=["9"],
+        text_signals=["survival", "survive", "after termination", "post-termination"],
+        clauses=clauses)
+    evals.append({
+        "id": "confidentiality_survival",
+        "provision_name": "Confidentiality Survival Beyond Termination",
+        "name": "Confidentiality Survival Beyond Termination",
+        "status": "PRESENT" if ("surviv" in text) else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": [] if ("surviv" in text) else ["Explicit survival period"],
+        "details": "Confidentiality survival is addressed." if ("surviv" in text) else
+                   "No explicit survival period for confidentiality obligations found.",
+        "commercial_significance": "Without survival, confidentiality duties terminate with the contract.",
+        "significance": "HIGH",
+        "commercial_legal_impact": "Trade secrets become unprotected upon contract termination.",
+        "recommendation": "Insert a survival clause specifying confidentiality obligations survive for 3-5 years post-termination." if not ("surviv" in text) else "",
+    })
+
+    # 8. Multi-Tier Dispute Resolution
+    found, clause = _has_clause(cb_type, cb_sec, text,
+        type_keys=["governing_law_dispute", "governing_law"],
+        sec_keys=["16"],
+        text_signals=["good-faith", "mediation", "arbitration", "informal discussions"],
+        clauses=clauses)
+    evals.append({
+        "id": "dispute_resolution",
+        "provision_name": "Multi-Tier Dispute Resolution & Arbitration Protocol",
+        "name": "Multi-Tier Dispute Resolution & Arbitration Protocol",
+        "status": "PARTIALLY_PRESENT" if found else "MISSING",
+        "actual_section_number": clause.get("section") if found else None,
+        "actual_section_heading": clause.get("section_title") if found else None,
+        "clause_reference": f"Section {clause.get('section')} ({clause.get('section_title')})" if found else "None",
+        "supporting_text": clause.get("text", "")[:350] if found else "",
+        "missing_elements": ["Formal mediation stage", "Defined arbitration protocol"],
+        "details": "Dispute resolution includes informal discussions but lacks defined arbitration protocol." if found else
+                   "No structured dispute resolution clause found.",
+        "commercial_significance": "Arbitration provides faster and more confidential resolution than public litigation.",
+        "significance": "MEDIUM",
+        "commercial_legal_impact": "Parties must litigate in open court without an arbitration clause.",
+        "recommendation": "Add a formal mediation step followed by binding arbitration under defined rules.",
+    })
+
+    return evals
+
+
+def _eval_employment_provisions(ctx: dict) -> list[dict]:
+    """Evaluate missing provisions for Employment Contracts."""
+    cb_sec  = ctx["clause_by_sec"]
+    cb_type = ctx["clause_by_type"]
+    text    = ctx["combined_text"]
+    clauses = ctx.get("clauses", [])
+    evals   = []
+
+    benchmarks = [
+        ("compensation_benefits", "Compensation & Benefits",
+         ["payment"], [], ["salary", "compensation", "remuneration", "wage"]),
+        ("probation_period", "Probation Period",
+         [], [], ["probation", "probationary period", "trial period"]),
+        ("leave_policy", "Leave & Holiday Policy",
+         [], [], ["annual leave", "paid leave", "holiday", "sick leave"]),
+        ("termination_notice", "Termination Notice Requirements",
+         ["termination"], [], ["notice period", "termination notice"]),
+        ("confidentiality", "Confidentiality Obligations",
+         ["confidentiality"], [], ["confidential", "non-disclosure"]),
+        ("non_compete", "Non-compete & Non-solicitation",
+         ["non_compete"], [], ["non-compete", "non-solicitation"]),
+        ("ip_assignment", "IP Assignment",
+         ["intellectual_property"], [], ["intellectual property", "work product", "invention"]),
+        ("governing_law", "Governing Law & Jurisdiction",
+         ["governing_law", "governing_law_dispute"], [], ["governing law", "jurisdiction"]),
+    ]
+
+    for bid, bname, type_keys, sec_keys, text_sigs in benchmarks:
+        found, clause = _has_clause(cb_type, cb_sec, text, type_keys, sec_keys, text_sigs, clauses=clauses)
+        sec_num = clause.get("section")
+        sec_title = clause.get("section_title")
+        clause_ref = f"Section {sec_num} ({sec_title})" if found and sec_num and sec_title else f"Section {sec_num}" if found and sec_num else "Present in document" if found else "None"
+        evals.append({
+            "id": bid,
+            "provision_name": bname,
+            "name": bname,
+            "status": "PRESENT" if found else "MISSING",
+            "actual_section_number": sec_num if found else None,
+            "actual_section_heading": sec_title if found else None,
+            "clause_reference": clause_ref,
+            "supporting_text": clause.get("text", "")[:350] if found else "",
+            "missing_elements": [] if found else [f"{bname} clause"],
+            "details": f"{bname} is present." if found else f"Agreement does not include {bname} provisions.",
+            "commercial_significance": f"{bname} is an important component of an employment agreement.",
+            "significance": "HIGH" if bid in ("compensation_benefits", "termination_notice", "confidentiality") else "MEDIUM",
+            "commercial_legal_impact": f"Absence of {bname} provisions creates ambiguity.",
+            "recommendation": f"Add explicit {bname} provisions." if not found else "",
         })
 
-    # 3. Force Majeure Clause
-    has_fm = "force_majeure" in clause_by_type or "force majeure" in combined_text or "act of god" in combined_text
-    if has_fm:
-        evaluations.append({
-            "id": "force_majeure",
-            "provision_name": "Force Majeure Clause",
-            "name": "Force Majeure Clause",
-            "status": "PRESENT",
-            "actual_section_number": "Force Majeure",
-            "actual_section_heading": "Force Majeure",
-            "clause_reference": "Force Majeure Clause",
-            "supporting_text": "Standard force majeure relief is provided for uncontrollable events.",
-            "missing_elements": [],
-            "details": "Standard force majeure relief is provided for uncontrollable events.",
-            "commercial_significance": "Excuses non-performance caused by unforeseen external events.",
+    return evals
+
+
+def _eval_property_lease_provisions(ctx: dict) -> list[dict]:
+    """Evaluate missing provisions for Property Lease Agreements."""
+    cb_sec  = ctx["clause_by_sec"]
+    cb_type = ctx["clause_by_type"]
+    text    = ctx["combined_text"]
+    clauses = ctx.get("clauses", [])
+    evals   = []
+
+    benchmarks = [
+        ("rent_payment", "Rent Payment Terms",
+         ["payment"], [], ["rent", "rental amount", "monthly rent"]),
+        ("deposit_terms", "Security Deposit",
+         [], [], ["security deposit", "deposit", "refundable deposit"]),
+        ("maintenance_repairs", "Maintenance & Repairs",
+         [], [], ["maintenance", "repairs", "repair obligation"]),
+        ("subletting", "Subletting & Assignment Restrictions",
+         ["assignment"], [], ["sublet", "subletting", "sub-lease", "assignment"]),
+        ("termination_notice", "Termination Notice",
+         ["termination"], [], ["notice period", "termination notice", "vacate"]),
+        ("governing_law", "Governing Law & Jurisdiction",
+         ["governing_law", "governing_law_dispute"], [], ["governing law", "jurisdiction"]),
+    ]
+
+    for bid, bname, type_keys, sec_keys, text_sigs in benchmarks:
+        found, clause = _has_clause(cb_type, cb_sec, text, type_keys, sec_keys, text_sigs, clauses=clauses)
+        sec_num = clause.get("section")
+        sec_title = clause.get("section_title")
+        clause_ref = f"Section {sec_num} ({sec_title})" if found and sec_num and sec_title else f"Section {sec_num}" if found and sec_num else "Present in document" if found else "None"
+        evals.append({
+            "id": bid,
+            "provision_name": bname,
+            "name": bname,
+            "status": "PRESENT" if found else "MISSING",
+            "actual_section_number": sec_num if found else None,
+            "actual_section_heading": sec_title if found else None,
+            "clause_reference": clause_ref,
+            "supporting_text": clause.get("text", "")[:350] if found else "",
+            "missing_elements": [] if found else [f"{bname} clause"],
+            "details": f"{bname} is present." if found else f"Agreement does not include {bname} provisions.",
+            "commercial_significance": f"{bname} is a standard component of a lease agreement.",
+            "significance": "HIGH" if bid in ("rent_payment", "deposit_terms", "termination_notice") else "MEDIUM",
+            "commercial_legal_impact": f"Absence of {bname} creates risk for both landlord and tenant.",
+            "recommendation": f"Add explicit {bname} provisions." if not found else "",
+        })
+
+    return evals
+
+
+def _eval_loan_provisions(ctx: dict) -> list[dict]:
+    """Evaluate missing provisions for Loan and Financing Agreements."""
+    cb_sec  = ctx["clause_by_sec"]
+    cb_type = ctx["clause_by_type"]
+    text    = ctx["combined_text"]
+    clauses = ctx.get("clauses", [])
+    evals   = []
+
+    benchmarks = [
+        ("principal_disbursement", "Principal Amount & Disbursement",
+         ["payment"], [], ["principal", "disbursement", "loan amount", "facility amount", "advance"]),
+        ("interest_rate_terms", "Interest Rate & Calculation",
+         [], [], ["interest rate", "per annum", "interest calculation", "base rate", "margin", "accrue"]),
+        ("repayment_schedule", "Repayment Schedule & Maturity",
+         ["payment"], [], ["repayment", "maturity date", "amortization", "installment", "due date", "repay"]),
+        ("events_of_default", "Events of Default & Acceleration",
+         ["termination"], [], ["events of default", "default", "acceleration", "failure to pay", "insolvency"]),
+        ("prepayment_terms", "Prepayment Terms & Conditions",
+         [], [], ["prepayment", "voluntary prepayment", "prepayment penalty", "prepayment fee", "prepay"]),
+        ("governing_law", "Governing Law & Jurisdiction",
+         ["governing_law", "governing_law_dispute"], [], ["governing law", "jurisdiction"]),
+    ]
+
+    for bid, bname, type_keys, sec_keys, text_sigs in benchmarks:
+        found, clause = _has_clause(cb_type, cb_sec, text, type_keys, sec_keys, text_sigs, clauses=clauses)
+        sec_num = clause.get("section")
+        sec_title = clause.get("section_title")
+        clause_ref = f"Section {sec_num} ({sec_title})" if found and sec_num and sec_title else f"Section {sec_num}" if found and sec_num else "Present in document" if found else "None"
+        evals.append({
+            "id": bid,
+            "provision_name": bname,
+            "name": bname,
+            "status": "PRESENT" if found else "MISSING",
+            "actual_section_number": sec_num if found else None,
+            "actual_section_heading": sec_title if found else None,
+            "clause_reference": clause_ref,
+            "supporting_text": clause.get("text", "")[:350] if found else "",
+            "missing_elements": [] if found else [f"{bname} clause"],
+            "details": f"{bname} is present." if found else f"Agreement does not include {bname} provisions.",
+            "commercial_significance": f"{bname} is an essential component of a debt and loan financing facility.",
+            "significance": "HIGH" if bid in ("principal_disbursement", "interest_rate_terms", "repayment_schedule", "events_of_default") else "MEDIUM",
+            "commercial_legal_impact": f"Absence of explicit {bname} exposes lender and borrower to financial dispute and enforcement failure.",
+            "recommendation": f"Add explicit {bname} terms." if not found else "",
+        })
+
+    return evals
+
+
+def _eval_generic_provisions(ctx: dict) -> list[dict]:
+    """Evaluate missing provisions for General / Other Agreements."""
+    cb_sec  = ctx["clause_by_sec"]
+    cb_type = ctx["clause_by_type"]
+    text    = ctx["combined_text"]
+    clauses = ctx.get("clauses", [])
+    evals   = []
+
+    benchmarks = [
+        ("parties_obligations", "Parties and Obligations",
+         ["parties", "purpose_scope"], [], ["parties", "obligations"]),
+        ("confidentiality", "Confidentiality",
+         ["confidentiality"], [], ["confidential", "non-disclosure"]),
+        ("termination", "Termination Rights",
+         ["termination"], [], ["termination", "terminate", "notice period"]),
+        ("liability", "Limitation of Liability",
+         ["liability"], [], ["liability", "limitation", "damages"]),
+        ("governing_law", "Governing Law & Jurisdiction",
+         ["governing_law", "governing_law_dispute"], [], ["governing law", "jurisdiction"]),
+        ("dispute_resolution", "Dispute Resolution",
+         ["dispute_resolution", "governing_law_dispute"], [], ["dispute", "arbitration", "mediation"]),
+    ]
+
+    for bid, bname, type_keys, sec_keys, text_sigs in benchmarks:
+        found, clause = _has_clause(cb_type, cb_sec, text, type_keys, sec_keys, text_sigs, clauses=clauses)
+        sec_num = clause.get("section")
+        sec_title = clause.get("section_title")
+        clause_ref = f"Section {sec_num} ({sec_title})" if found and sec_num and sec_title else f"Section {sec_num}" if found and sec_num else "Present in document" if found else "None"
+        evals.append({
+            "id": bid,
+            "provision_name": bname,
+            "name": bname,
+            "status": "PRESENT" if found else "MISSING",
+            "actual_section_number": sec_num if found else None,
+            "actual_section_heading": sec_title if found else None,
+            "clause_reference": clause_ref,
+            "supporting_text": clause.get("text", "")[:350] if found else "",
+            "missing_elements": [] if found else [f"{bname} clause"],
+            "details": f"{bname} is present." if found else f"Agreement does not include {bname} provisions.",
+            "commercial_significance": f"{bname} is a standard commercial agreement component.",
             "significance": "MEDIUM",
-            "commercial_legal_impact": "Excuses non-performance caused by unforeseen external events.",
-            "recommendation": "Ensure notification deadlines for force majeure events are adhered to.",
-        })
-    else:
-        evaluations.append({
-            "id": "force_majeure",
-            "provision_name": "Force Majeure Clause",
-            "name": "Force Majeure Clause",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": [
-                "Relief from performance delays due to uncontrollable events",
-                "Force majeure notice and mitigation obligations",
-                "Termination right if force majeure delay persists beyond 30 days",
-            ],
-            "details": "No force majeure clause exists to excuse performance delays or milestone delivery failures caused by acts of God, pandemics, war, government restrictions, or infrastructure outages.",
-            "commercial_significance": "Parties remain strictly liable for delivery delays and default damages even when performance is rendered impossible by external uncontrollable events.",
-            "significance": "MEDIUM",
-            "commercial_legal_impact": "Parties remain strictly liable for delivery delays and default damages even when performance is rendered impossible by external uncontrollable events.",
-            "recommendation": "Incorporate a standard mutual force majeure clause excusing delays caused by acts of God, infrastructure failures, war, pandemics, or government actions, with termination rights if prolonged beyond 30 days.",
+            "commercial_legal_impact": f"Absence of {bname} creates ambiguity.",
+            "recommendation": f"Add explicit {bname} provisions." if not found else "",
         })
 
-    # 4. Security Incident & Data Breach Notification
-    sec11_clause = clause_by_sec.get("11") or clause_by_type.get("data_protection")
-    if sec11_clause:
-        s11_text = sec11_clause.get("text", "")
-        has_strict_deadline = any(d in s11_text.lower() for d in ["24 hours", "48 hours", "72 hours", "immediate notice"])
-        evaluations.append({
-            "id": "security_incident_notification",
-            "provision_name": "Security Incident & Data Breach Notification",
-            "name": "Security Incident & Data Breach Notification",
-            "status": "PRESENT" if has_strict_deadline else "PARTIALLY_PRESENT",
-            "actual_section_number": "11",
-            "actual_section_heading": "Data Protection and Security",
-            "clause_reference": "Section 11 (Data Protection and Security)",
-            "supporting_text": s11_text[:350].strip() if s11_text else "The Service Provider will use reasonable technical and organisational measures to protect Client data in its possession and will notify the Client without undue delay after becoming aware of a confirmed security incident affecting Client data.",
-            "missing_elements": [
-                "Mandatory breach notification deadline (e.g., within 24 to 72 hours)",
-                "Forensic incident investigation and root-cause disclosure",
-                "Cooperation in statutory reporting under DPDP Act 2023 / CERT-In directions",
-            ] if not has_strict_deadline else [],
-            "details": "Section 11 mandates reasonable technical and organizational safeguards to protect Client data and notification without undue delay, but fails to define a mandatory security breach notification deadline (e.g. 24-72 hours) or incident response protocol.",
-            "commercial_significance": "Exposes the Client to severe regulatory fines and reporting failures under DPDP Act 2023 and CERT-In guidelines in the event of an undetected security compromise.",
-            "significance": "CRITICAL",
-            "commercial_legal_impact": "Exposes the Client to severe regulatory fines and reporting failures under DPDP Act 2023 and CERT-In guidelines in the event of an undetected security compromise.",
-            "recommendation": "Specify a strict breach notification window (e.g., within 24–48 hours of confirmed incident) with mandated incident reports and mitigation cooperation.",
-        })
-    else:
-        evaluations.append({
-            "id": "security_incident_notification",
-            "provision_name": "Security Incident & Data Breach Notification",
-            "name": "Security Incident & Data Breach Notification",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": ["Data security safeguards", "Incident notification covenant"],
-            "details": "Zero data security or security incident reporting covenants in the agreement.",
-            "commercial_significance": "Severe data security vulnerability without developer compliance covenants.",
-            "significance": "CRITICAL",
-            "commercial_legal_impact": "Severe data security vulnerability without developer compliance covenants.",
-            "recommendation": "Add comprehensive data protection and breach notification covenants.",
-        })
-
-    # 5. Data Backup, Disaster Recovery & Secure Deletion
-    has_backup = any(k in combined_text for k in ["backup schedule", "disaster recovery", "secure deletion", "secure wipe", "data return"])
-    if has_backup:
-        evaluations.append({
-            "id": "backup_and_data_deletion",
-            "provision_name": "Data Backup, Disaster Recovery & Secure Deletion",
-            "name": "Data Backup, Disaster Recovery & Secure Deletion",
-            "status": "PRESENT",
-            "actual_section_number": "Data Management",
-            "actual_section_heading": "Data Management",
-            "clause_reference": "Data Management Clause",
-            "supporting_text": "Backup and post-termination data deletion obligations are defined.",
-            "missing_elements": [],
-            "details": "Backup and post-termination data deletion obligations are defined.",
-            "commercial_significance": "Ensures business continuity and safe data lifecycle management.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Ensures business continuity and safe data lifecycle management.",
-            "recommendation": "Maintain scheduled audits of backup integrity and restoration procedures.",
-        })
-    else:
-        evaluations.append({
-            "id": "backup_and_data_deletion",
-            "provision_name": "Data Backup, Disaster Recovery & Secure Deletion",
-            "name": "Data Backup, Disaster Recovery & Secure Deletion",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": [
-                "Regular automated data backup schedule",
-                "Disaster recovery RTO and RPO benchmarks",
-                "Certified secure data deletion or return upon termination",
-            ],
-            "details": "The contract omits commitments regarding regular data backup schedules, disaster recovery procedures, or certified secure data deletion/return upon contract termination.",
-            "commercial_significance": "Creates significant risk of permanent project data loss during development and unverified retention of client confidential records post-termination.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Creates significant risk of permanent project data loss during development and unverified retention of client confidential records post-termination.",
-            "recommendation": "Require documented daily/weekly backup routines during development and certified cryptographic deletion or full handover of client data upon termination.",
-        })
-
-    # 6. Source Code Handover & Deployment Documentation
-    sec3_clause = clause_by_sec.get("3") or clause_by_type.get("deliverables")
-    sec10_clause = clause_by_sec.get("10") or clause_by_type.get("intellectual_property")
-    if sec3_clause and ("source code" in combined_text or "build instruction" in combined_text):
-        s3_text = sec3_clause.get("text", "")
-        evaluations.append({
-            "id": "source_code_handover",
-            "provision_name": "Source Code Handover & Deployment Documentation",
-            "name": "Source Code Handover & Deployment Documentation",
-            "status": "PRESENT",
-            "actual_section_number": "3 & 10",
-            "actual_section_heading": "Deliverables & Intellectual Property",
-            "clause_reference": "Section 3 (Deliverables) & Section 10 (Intellectual Property)",
-            "supporting_text": s3_text[:350].strip() if s3_text else "3.1 The Service Provider will provide: (a) a responsive web application; (b) source code for custom-developed components; (c) database schema and migration scripts; (d) test summary; (e) deployment and setup instructions; and (f) one handover session of up to two hours.",
-            "missing_elements": [],
-            "details": "Section 3 and Section 10 explicitly mandate delivery of complete source code repositories, compiled binaries, architectural documentation, and build instructions upon fee settlement.",
-            "commercial_significance": "Secures operational independence by enabling the Client or alternate vendors to deploy, debug, and maintain the custom software autonomously.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Secures operational independence by enabling the Client or alternate vendors to deploy, debug, and maintain the custom software autonomously.",
-            "recommendation": "Ensure delivery criteria in Section 3 are strictly verified before approving the final milestone payment under Section 5.",
-        })
-    else:
-        evaluations.append({
-            "id": "source_code_handover",
-            "provision_name": "Source Code Handover & Deployment Documentation",
-            "name": "Source Code Handover & Deployment Documentation",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": ["Uncompiled source code delivery", "Architecture and deployment documentation"],
-            "details": "No explicit obligation to deliver uncompiled source code or technical architecture documentation.",
-            "commercial_significance": "Client risks vendor lock-in and inability to maintain software without the original developer.",
-            "significance": "CRITICAL",
-            "commercial_legal_impact": "Client risks vendor lock-in and inability to maintain software without the original developer.",
-            "recommendation": "Mandate full source code repository handover, database scripts, and deployment guide as milestone deliverables.",
-        })
-
-    # 7. Third-Party Software & Open-Source Licensing Disclosure
-    if sec10_clause:
-        s10_text = sec10_clause.get("text", "")
-        has_oss_warranty = "open-source" in s10_text.lower() or "copyleft" in s10_text.lower() or "sbom" in s10_text.lower()
-        evaluations.append({
-            "id": "third_party_licensing",
-            "provision_name": "Third-Party Software & Open-Source Licensing Disclosure",
-            "name": "Third-Party Software & Open-Source Licensing Disclosure",
-            "status": "PRESENT" if has_oss_warranty else "PARTIALLY_PRESENT",
-            "actual_section_number": "10",
-            "actual_section_heading": "Intellectual Property",
-            "clause_reference": "Section 10 (Intellectual Property)",
-            "supporting_text": s10_text[:350].strip() if s10_text else "Upon full payment of all amounts due, the Service Provider assigns to the Client the intellectual property rights in the bespoke deliverables created specifically for the Client under this Agreement, excluding Pre-Existing Materials and third-party materials. The Service Provider retains ownership of tools, libraries, templates, know-how, and generic components developed prior to or independently of this Agreement ('Pre-Existing Materials'). To the extent Pre-Existing Materials are incorporated into the deliverables, the Service Provider grants the Client a perpetual, non-exclusive, worldwide, royalty-free licence to use them solely as part of the deliverables.",
-            "missing_elements": [
-                "Open-source software (OSS) disclosure / bill of materials (SBOM)",
-                "Warranty against viral copyleft licenses (GPL/AGPL)",
-                "Third-party IP infringement indemnification",
-            ] if not has_oss_warranty else [],
-            "details": "Section 10 licenses pre-existing developer tools and libraries perpetually, but lacks an open-source software (OSS) disclosure requirement, copyleft exclusion, or third-party IP infringement indemnification.",
-            "commercial_significance": "Client risks inheriting restrictive copyleft viral licenses (e.g., GPL) or third-party infringement claims without developer defense commitments.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Client risks inheriting restrictive copyleft viral licenses (e.g., GPL) or third-party infringement claims without developer defense commitments.",
-            "recommendation": "Add an open-source software warranty requiring prior disclosure of third-party libraries and prohibiting viral copyleft licenses without written Client consent.",
-        })
-    else:
-        evaluations.append({
-            "id": "third_party_licensing",
-            "provision_name": "Third-Party Software & Open-Source Licensing Disclosure",
-            "name": "Third-Party Software & Open-Source Licensing Disclosure",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": ["Third-party component terms", "Open-source licensing covenants"],
-            "details": "No provisions governing third-party libraries, dependencies, or open-source software use.",
-            "commercial_significance": "Unregulated third-party software risks intellectual property infringement claims.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Unregulated third-party software risks intellectual property infringement claims.",
-            "recommendation": "Incorporate third-party component licensing representations and indemnities.",
-        })
-
-    # 8. Confidentiality Survival Beyond Termination
-    sec9_clause = clause_by_sec.get("9") or clause_by_type.get("confidentiality")
-    if sec9_clause:
-        s9_text = sec9_clause.get("text", "")
-        has_explicit_survival = "surviv" in s9_text.lower() or "following termination" in s9_text.lower()
-        evaluations.append({
-            "id": "confidentiality_survival",
-            "provision_name": "Confidentiality Survival Beyond Termination",
-            "name": "Confidentiality Survival Beyond Termination",
-            "status": "PRESENT" if has_explicit_survival else "PARTIALLY_PRESENT",
-            "actual_section_number": "9",
-            "actual_section_heading": "Confidentiality",
-            "clause_reference": "Section 9 (Confidentiality)",
-            "supporting_text": s9_text[:350].strip() if s9_text else "Each Party may receive non-public business, technical, financial, or operational information from the other Party ('Confidential Information'). The receiving Party will use it only to perform or receive services under this Agreement, protect it using reasonable care, and disclose it only to personnel who need to know and are bound by confidentiality obligations.",
-            "missing_elements": [
-                "Post-termination survival duration: NOT SPECIFIED in agreement (recommend 2–5 years or indefinite for trade secrets)",
-                "Explicit survival clause in Section 14 or Section 17",
-                "Post-termination return or destruction of Confidential Information",
-            ] if not has_explicit_survival else [],
-            "details": "Section 9 establishes comprehensive non-disclosure obligations during the active engagement, but omits an explicit survival clause specifying that confidentiality survives contract termination or expiration. Survival period is NOT SPECIFIED in the agreement.",
-            "commercial_significance": "Survival period is NOT SPECIFIED in the agreement. Creates legal ambiguity regarding whether confidentiality obligations lapse upon contract termination, potentially leaving trade secrets and proprietary code unprotected post-engagement.",
-            "significance": "HIGH",
-            "commercial_legal_impact": "Creates legal ambiguity regarding whether confidentiality obligations lapse upon contract termination, potentially leaving trade secrets and proprietary code unprotected post-engagement.",
-            "recommendation": "Insert an express survival provision in Section 9 or Section 17 specifying that confidentiality obligations survive termination or expiration for a period of at least three (3) to five (5) years, and indefinitely for trade secrets.",
-        })
-    else:
-        evaluations.append({
-            "id": "confidentiality_survival",
-            "provision_name": "Confidentiality Survival Beyond Termination",
-            "name": "Confidentiality Survival Beyond Termination",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": ["Confidentiality covenant", "Post-termination survival"],
-            "details": "Agreement completely lacks confidentiality and post-termination survival provisions.",
-            "commercial_significance": "Proprietary information could legally be shared with competitors once the agreement ends.",
-            "significance": "CRITICAL",
-            "commercial_legal_impact": "Proprietary information could legally be shared with competitors once the agreement ends.",
-            "recommendation": "Add a comprehensive non-disclosure clause with explicit survival.",
-        })
-
-    # 9. Multi-Tier Dispute Resolution & Arbitration Protocol
-    sec16_clause = clause_by_sec.get("16") or clause_by_type.get("governing_law_dispute") or clause_by_type.get("governing_law")
-    if sec16_clause:
-        s16_text = sec16_clause.get("text", "")
-        has_arbitration = "arbitrat" in s16_text.lower()
-        evaluations.append({
-            "id": "dispute_resolution_procedure",
-            "provision_name": "Multi-Tier Dispute Resolution & Arbitration Protocol",
-            "name": "Multi-Tier Dispute Resolution & Arbitration Protocol",
-            "status": "PRESENT" if has_arbitration else "PARTIALLY_PRESENT",
-            "actual_section_number": "16",
-            "actual_section_heading": "Governing Law and Dispute Resolution",
-            "clause_reference": "Section 16 (Governing Law and Dispute Resolution)",
-            "supporting_text": s16_text[:350].strip() if s16_text else "The Parties will first attempt in good faith to resolve any dispute through discussions between authorised representatives. If the dispute is not resolved within thirty (30) days, the Parties may refer it to the competent courts at Surat, Gujarat, subject to applicable law.",
-            "missing_elements": [
-                "Institutional or ad-hoc arbitration framework (e.g. Arbitration and Conciliation Act 1996)",
-                "Formal mediation protocol prior to litigation",
-                "Specific seat/venue and number of arbitrators",
-            ] if not has_arbitration else [],
-            "details": "Section 16 mandates a 30-day informal discussion period followed by jurisdiction in competent courts at Surat, Gujarat, but omits a binding arbitration framework (e.g. Arbitration and Conciliation Act 1996) or mediation protocol.",
-            "commercial_significance": "Disputes are subject to regular court litigation in Surat, Gujarat, risking prolonged public judicial proceedings and substantial legal overhead.",
-            "significance": "MEDIUM",
-            "commercial_legal_impact": "Disputes are subject to regular court litigation, risking prolonged public judicial proceedings and substantial legal overhead.",
-            "recommendation": "Incorporate a binding arbitration clause designating Surat or Ahmedabad as seat under the Indian Arbitration and Conciliation Act 1996, with expedited rules for commercial disputes.",
-        })
-    else:
-        evaluations.append({
-            "id": "dispute_resolution_procedure",
-            "provision_name": "Multi-Tier Dispute Resolution & Arbitration Protocol",
-            "name": "Multi-Tier Dispute Resolution & Arbitration Protocol",
-            "status": "MISSING",
-            "actual_section_number": None,
-            "actual_section_heading": None,
-            "clause_reference": "None",
-            "supporting_text": "",
-            "missing_elements": ["Dispute escalation process", "Governing law & jurisdiction"],
-            "details": "No dispute resolution or escalation procedures provided.",
-            "commercial_significance": "Creates procedural uncertainty in handling contract disputes.",
-            "significance": "MEDIUM",
-            "commercial_legal_impact": "Creates procedural uncertainty in handling contract disputes.",
-            "recommendation": "Specify governing law and multi-tier dispute resolution mechanism.",
-        })
-
-    return evaluations
+    return evals

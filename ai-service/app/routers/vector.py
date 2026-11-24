@@ -1,9 +1,11 @@
 """
 Vector & Summary Router — Part 10
-Provides endpoints for FAISS vector indexing, vector similarity search, and document summary generation.
+Provides endpoints for FAISS vector indexing, vector similarity search,
+document summary generation, and in-memory FAISS LRU cache management.
 """
 
 import logging
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -12,6 +14,9 @@ from app.services.summary_service import generate_document_summary, DocumentSumm
 from app.services.vector_service import (
     create_and_save_faiss_index,
     search_faiss_index,
+    invalidate_faiss_cache,
+    clear_faiss_cache,
+    get_faiss_cache_stats,
     VectorSearchResult,
 )
 
@@ -36,6 +41,7 @@ class ChunkIndexInput(BaseModel):
 class IndexRequest(BaseModel):
     document_id: str = Field(..., description="MongoDB document ID")
     chunks:      list[ChunkIndexInput] = Field(..., min_length=1)
+    user_id:     Optional[str] = Field(default=None, description="Optional tenant user ID")
 
 
 class IndexResponse(BaseModel):
@@ -50,6 +56,7 @@ class SearchRequest(BaseModel):
     document_id: str = Field(..., description="MongoDB document ID")
     query:       str = Field(..., min_length=1, description="Natural language search query")
     top_k:       int = Field(default=5, ge=1, le=20)
+    user_id:     Optional[str] = Field(default=None, description="Optional tenant user ID")
 
 
 class SearchResultSchema(BaseModel):
@@ -72,11 +79,35 @@ class SearchResponse(BaseModel):
     results:       list[SearchResultSchema]
 
 
+class CacheStatsResponse(BaseModel):
+    hits:          int
+    misses:        int
+    evictions:     int
+    current_size:  int
+    max_size:      int
+    hit_ratio:     float
+
+
+class CacheInvalidateResponse(BaseModel):
+    success:           bool
+    document_id:       str
+    invalidated_count: int
+
+
+class CacheClearResponse(BaseModel):
+    success:       bool
+    cleared_count: int
+
+
 @router.post("/index", response_model=IndexResponse)
 async def index_document_vectors(request: IndexRequest) -> IndexResponse:
     try:
         chunks_data = [c.model_dump() for c in request.chunks]
-        res = create_and_save_faiss_index(request.document_id, chunks_data)
+        res = create_and_save_faiss_index(
+            request.document_id,
+            chunks_data,
+            user_id=request.user_id,
+        )
 
         return IndexResponse(
             success=True,
@@ -97,6 +128,7 @@ async def search_document_vectors(request: SearchRequest) -> SearchResponse:
             document_id=request.document_id,
             query=request.query,
             top_k=request.top_k,
+            user_id=request.user_id,
         )
 
         return SearchResponse(
@@ -113,11 +145,49 @@ async def search_document_vectors(request: SearchRequest) -> SearchResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Cache Management Endpoints (Phase 4 / ERR-RAG-001) ──────
+
+@router.get("/cache/stats", response_model=CacheStatsResponse)
+async def get_cache_stats_endpoint() -> CacheStatsResponse:
+    """Returns runtime statistics for the in-memory FAISS LRU cache."""
+    return CacheStatsResponse(**get_faiss_cache_stats())
+
+
+@router.post("/cache/invalidate/{document_id}", response_model=CacheInvalidateResponse)
+async def invalidate_document_cache(document_id: str) -> CacheInvalidateResponse:
+    """Invalidates cached FAISS index and metadata for a specific document."""
+    try:
+        count = invalidate_faiss_cache(document_id)
+        return CacheInvalidateResponse(
+            success=True,
+            document_id=document_id,
+            invalidated_count=count,
+        )
+    except Exception as e:
+        logger.error(f"Failed to invalidate FAISS cache for {document_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/cache/clear", response_model=CacheClearResponse)
+async def clear_cache_endpoint() -> CacheClearResponse:
+    """Clears all entries from the in-memory FAISS LRU cache."""
+    try:
+        count = clear_faiss_cache()
+        return CacheClearResponse(
+            success=True,
+            cleared_count=count,
+        )
+    except Exception as e:
+        logger.error(f"Failed to clear FAISS cache: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/health")
 async def vector_health():
     return {
         "status": "operational",
         "embedding_model": "all-MiniLM-L6-v2 (384-dim)",
         "vector_store": "FAISS",
+        "cache": "LRU",
         "parts_complete": ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10"],
     }

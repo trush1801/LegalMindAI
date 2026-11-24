@@ -20,12 +20,46 @@ const { aiServiceClient } = require('./aiService');
 const { getFormatFromMime } = require('../middleware/upload.middleware');
 const { compareClauses, computeWordDiff } = require('../utils/diffHelper');
 const { extractContractObligations, generateIcsCalendar } = require('../utils/contractObligationsHelper');
+const config = require('../config/env');
 
 const logger = {
   info:  (...a) => console.log('[document.service]', ...a),
   warn:  (...a) => console.warn('[document.service]', ...a),
   error: (...a) => console.error('[document.service]', ...a),
+  debug: (...a) => {},
 };
+
+/**
+ * Path-aware containment check (ERR-SEC-001 / Phase 2 Hardening)
+ * Ensures targetPath resolves strictly within baseDir, preventing path traversal
+ * and sibling prefix collision (e.g., /storage vs /storage_malicious).
+ */
+function isPathInsideDirectory(baseDir, targetPath) {
+  if (!baseDir || !targetPath) return false;
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedTarget = path.resolve(targetPath);
+  const rel = path.relative(resolvedBase, resolvedTarget);
+  return !rel.startsWith('..') && !path.isAbsolute(rel) && rel.length > 0;
+}
+
+/**
+ * Resolves full document text with robust fallback hierarchy (ERR-DATA-001)
+ * Hierarchy:
+ *   1. metadata.extractedText (full extracted contract text)
+ *   2. Reconstructed text from extracted clauses
+ *   3. metadata.plainSummary (plain language summary fallback)
+ */
+function resolveDocFullText(doc) {
+  if (doc?.metadata?.extractedText && typeof doc.metadata.extractedText === 'string' && doc.metadata.extractedText.trim().length > 0) {
+    return doc.metadata.extractedText;
+  }
+  const clauses = doc?.analysis?.clauses || [];
+  if (clauses.length > 0) {
+    const reconstructed = clauses.map(c => c.text || '').filter(Boolean).join('\n\n');
+    if (reconstructed.trim().length > 0) return reconstructed;
+  }
+  return doc?.metadata?.plainSummary || '';
+}
 
 // ── Document Type Configuration ───────────────────────────
 const DOCUMENT_TYPES = {
@@ -199,14 +233,24 @@ const sendToAIService = async (documentId, userId, filePath, documentInfo) => {
         {
           documentId,
           userId,
-          pageCount:        result.total_pages      || 1,
-          wordCount:        result.total_words       || 0,
+          pageCount:            result.total_pages      || 1,
+          estimatedPageCount:   result.estimated_page_count || result.total_pages || 1,
+          pageCountIsEstimated: Boolean(result.page_count_is_estimated),
+          wordCount:            result.total_words       || 0,
           rawWordCount:     result.raw_word_count    || result.total_words || 0,
           characterCount:   result.total_chars       || 0,
           detectedLanguage: result.detected_language || 'en',
           extractionMethod: result.extraction_method || 'unknown',
           extractedAt:      new Date(),
-          extractedText:    result.plain_summary     || '',
+          extractedText:    (() => {
+            const full = result.full_text || result.extracted_text || result.plain_summary || '';
+            // Safe guard against MongoDB 16MB BSON document size limit (truncate at 12MB if necessary)
+            if (full && full.length > 12 * 1024 * 1024) {
+              return full.slice(0, 12 * 1024 * 1024) + '\n\n[Truncated at 12MB]';
+            }
+            return full;
+          })(),
+          plainSummary:     result.plain_summary || '',
         },
         { upsert: true, new: true }
       );
@@ -474,18 +518,21 @@ const deleteDocument = async (documentId, userId, role) => {
   // 1. Remove physical document file if present
   if (document.filePath && fs.existsSync(document.filePath)) {
     try {
-      fs.unlinkSync(document.filePath);
-      logger.info(`Unlinked source file: ${document.filePath}`);
+      const resolvedDocPath = path.resolve(document.filePath);
+      if (isPathInsideDirectory(config.STORAGE_DIR, resolvedDocPath)) {
+        fs.unlinkSync(resolvedDocPath);
+        logger.info(`Unlinked source file: ${resolvedDocPath}`);
+      } else {
+        logger.warn(`Source file ${resolvedDocPath} outside STORAGE_DIR, skipping unlink.`);
+      }
     } catch (e) {
       logger.warn(`Could not unlink source file ${document.filePath}:`, e.message);
     }
   }
 
-  // 2. Remove FAISS vector indexes if present
-  const projectRoot = path.resolve(__dirname, '../../../');
-  const faissDir = path.join(projectRoot, 'faiss_indexes');
-  const indexFile = path.join(faissDir, `${documentId}.index`);
-  const metaFile = path.join(faissDir, `${documentId}_meta.json`);
+  // 2. Remove FAISS vector indexes if present (Phase 1C / NEW-001)
+  const indexFile = path.join(config.FAISS_DIR, `${documentId}.index`);
+  const metaFile  = path.join(config.FAISS_DIR, `${documentId}_meta.json`);
   [indexFile, metaFile].forEach((f) => {
     if (fs.existsSync(f)) {
       try {
@@ -497,15 +544,21 @@ const deleteDocument = async (documentId, userId, role) => {
     }
   });
 
+  // Invalidate AI service in-memory FAISS LRU cache if active (Phase 4 / ERR-RAG-001)
+  try {
+    await aiServiceClient.post(`/vector/cache/invalidate/${documentId}`);
+  } catch (cacheErr) {
+    logger.debug(`FAISS cache invalidation call for ${documentId}: ${cacheErr.message}`);
+  }
+
   // 3. Clean up associated PDF reports in reports/
-  const reportsDir = path.join(projectRoot, 'reports');
-  if (fs.existsSync(reportsDir)) {
+  if (fs.existsSync(config.REPORTS_DIR)) {
     try {
-      const files = fs.readdirSync(reportsDir);
+      const files = fs.readdirSync(config.REPORTS_DIR);
       files.forEach((file) => {
         if (file.includes(String(documentId))) {
           try {
-            fs.unlinkSync(path.join(reportsDir, file));
+            fs.unlinkSync(path.join(config.REPORTS_DIR, file));
             logger.info(`Unlinked report artifact: ${file}`);
           } catch {}
         }
@@ -557,23 +610,21 @@ const purgeUserAllData = async (userId, actorInfo = null) => {
   // 1. Locate all documents belonging to this user
   const userDocs = await Document.find({ userId });
   const docIds = userDocs.map((d) => d._id);
-  const projectRoot = path.resolve(__dirname, '../../../');
-  const faissDir = path.join(projectRoot, 'faiss_indexes');
-  const reportsDir = path.join(projectRoot, 'reports');
-
   let unlinkedFilesCount = 0;
-
   // 2. Unlink individual source files, vector indexes, and reports
   for (const doc of userDocs) {
     if (doc.filePath && fs.existsSync(doc.filePath)) {
       try {
-        fs.unlinkSync(doc.filePath);
-        unlinkedFilesCount++;
+        const resolvedDocPath = path.resolve(doc.filePath);
+        if (isPathInsideDirectory(config.STORAGE_DIR, resolvedDocPath)) {
+          fs.unlinkSync(resolvedDocPath);
+          unlinkedFilesCount++;
+        }
       } catch {}
     }
 
-    const indexFile = path.join(faissDir, `${doc._id}.index`);
-    const metaFile = path.join(faissDir, `${doc._id}_meta.json`);
+    const indexFile = path.join(config.FAISS_DIR, `${doc._id}.index`);
+    const metaFile  = path.join(config.FAISS_DIR, `${doc._id}_meta.json`);
     [indexFile, metaFile].forEach((f) => {
       if (fs.existsSync(f)) {
         try {
@@ -583,24 +634,33 @@ const purgeUserAllData = async (userId, actorInfo = null) => {
       }
     });
 
-    if (fs.existsSync(reportsDir)) {
+    if (fs.existsSync(config.REPORTS_DIR)) {
       try {
-        const files = fs.readdirSync(reportsDir);
+        const files = fs.readdirSync(config.REPORTS_DIR);
         files.forEach((file) => {
           if (file.includes(String(doc._id))) {
             try {
-              fs.unlinkSync(path.join(reportsDir, file));
-              unlinkedFilesCount++;
+              const reportPath = path.join(config.REPORTS_DIR, file);
+              if (isPathInsideDirectory(config.REPORTS_DIR, reportPath)) {
+                fs.unlinkSync(reportPath);
+                unlinkedFilesCount++;
+              }
             } catch {}
           }
         });
       } catch {}
     }
+
+    // Invalidate AI service in-memory FAISS LRU cache for this document (Phase 4 / ERR-RAG-001)
+    try {
+      await aiServiceClient.post(`/vector/cache/invalidate/${doc._id}`);
+    } catch {}
   }
 
-  // 3. Remove user storage directory if present
-  const userStorageDir = path.join(projectRoot, 'storage', String(userId));
-  if (fs.existsSync(userStorageDir)) {
+  // 3. Remove user storage directory if present (Phase 1C / NEW-002)
+  const safeUserId = String(userId).replace(/[^a-zA-Z0-9_-]/g, '');
+  const userStorageDir = path.join(config.STORAGE_DIR, safeUserId);
+  if (isPathInsideDirectory(config.STORAGE_DIR, userStorageDir) && fs.existsSync(userStorageDir)) {
     try {
       fs.rmSync(userStorageDir, { recursive: true, force: true });
       logger.info(`Removed user storage directory: ${userStorageDir}`);
@@ -667,7 +727,7 @@ const purgeUserAllData = async (userId, actorInfo = null) => {
 
   return {
     success: true,
-    user: updatedUser?.toPublicJSON() || null,
+    user: typeof updatedUser?.toPublicJSON === 'function' ? updatedUser.toPublicJSON() : (updatedUser || null),
     purged: {
       documents: userDocs.length,
       filesUnlinked: unlinkedFilesCount,
@@ -953,9 +1013,9 @@ const compareDocuments = async (baseId, targetId, userId, role) => {
   // Clause-by-clause comparison with authentic risk analysis correlation
   const clauseComparisons = compareClauses(clausesA, clausesB, flaggedClausesA, flaggedClausesB);
 
-  // Full-text difference
-  const textA = docA.metadata?.extractedText || '';
-  const textB = docB.metadata?.extractedText || '';
+  // Full-text difference (ERR-DATA-001: with fallback resolution)
+  const textA = resolveDocFullText(docA);
+  const textB = resolveDocFullText(docB);
   const textDiff = computeWordDiff(textA, textB);
 
   // Aggregated change metrics
@@ -1047,8 +1107,17 @@ const getDocumentObligations = async (documentId, userId, role) => {
     reminderMap[r.obligationId] = r;
   }
 
-  const timelineWithReminders = extracted.timeline.map((item) => ({
+  const timelineWithReminders = (extracted.timeline || extracted.obligations || []).map((item) => ({
     ...item,
+    rawDateText: item.date || item.rawDateText || 'Not Specified',
+    formattedDueDate: item.date || item.formattedDueDate || 'Not Specified',
+    parsedDueDate: item.parsedDate || item.parsedDueDate || null,
+    boundParty: item.party || item.boundParty || 'All Parties',
+    party: item.party || item.boundParty || 'All Parties',
+    actionRequired: item.actionRequired || item.action || item.title,
+    action: item.action || item.actionRequired || item.title,
+    sourcePassage: item.sourcePassage || item.supportingEvidence || '',
+    supportingEvidence: item.sourcePassage || item.supportingEvidence || '',
     reminder: reminderMap[item.id] || null,
   }));
 
@@ -1063,6 +1132,7 @@ const getDocumentObligations = async (documentId, userId, role) => {
         activeRemindersCount: reminders.filter((r) => r.status === 'scheduled' || r.status === 'active').length,
       },
       timeline: timelineWithReminders,
+      obligations: timelineWithReminders,
       reminders,
     },
   };
@@ -1249,6 +1319,15 @@ const getUpcomingUserObligations = async (userId) => {
     .populate('riskFindings')
     .limit(25);
 
+  let processingCount = 0;
+  try {
+    processingCount = await Document.countDocuments({
+      userId,
+      processingStatus: { $in: ['pending', 'processing'] },
+      isDeleted: { $ne: true },
+    });
+  } catch {}
+
   const activeReminders = await ContractReminder.find({ userId, isDeleted: { $ne: true } });
   const reminderMap = new Map();
   for (const rem of activeReminders) {
@@ -1261,14 +1340,40 @@ const getUpcomingUserObligations = async (userId) => {
 
   for (const doc of docs) {
     try {
-      const metadata = doc.metadata || {};
-      const analysis = doc.analysis || {};
-      const extraction = extractContractObligations(doc, analysis, metadata);
+      let metadata = doc.metadata;
+      let analysis = doc.analysis;
+      if (!metadata) {
+        metadata = await DocumentMetadata.findOne({ documentId: doc._id });
+      }
+      if (!analysis) {
+        analysis = await AnalysisResult.findOne({ documentId: doc._id });
+      }
 
-      for (const item of (extraction.obligations || [])) {
+      const extraction = extractContractObligations(doc, analysis, metadata);
+      const items = extraction.obligations || extraction.timeline || [];
+
+      for (const item of items) {
         const rem = reminderMap.get(`${doc._id}_${item.id}`);
         allMilestones.push({
           ...item,
+          id: item.id,
+          category: item.category,
+          title: item.title,
+          certainty: item.certainty,
+          dateType: item.dateType,
+          date: item.formattedDueDate || item.date || item.rawDateText || 'Not Specified',
+          rawDateText: item.rawDateText || item.date || 'Not Specified',
+          formattedDueDate: item.formattedDueDate || item.date || 'Not Specified',
+          parsedDate: item.parsedDueDate || item.parsedDate || null,
+          parsedDueDate: item.parsedDueDate || item.parsedDate || null,
+          party: item.party || item.boundParty || 'All Parties',
+          boundParty: item.party || item.boundParty || 'All Parties',
+          actionRequired: item.actionRequired || item.action || item.title,
+          action: item.action || item.actionRequired || item.title,
+          sourcePassage: item.sourcePassage || item.supportingEvidence || '',
+          supportingEvidence: item.sourcePassage || item.supportingEvidence || '',
+          page: item.page || 1,
+          section: item.section || 'General Terms',
           documentId: doc._id,
           documentTitle: doc.originalName || doc.title,
           documentType: doc.documentType,
@@ -1297,6 +1402,10 @@ const getUpcomingUserObligations = async (userId) => {
     if (!a.parsedDueDate && b.parsedDueDate) return 1;
     return 0;
   });
+
+  // Attach processingCount and obligations properties for multi-format compatibility
+  allMilestones.processingCount = processingCount;
+  allMilestones.obligations = allMilestones;
 
   return allMilestones;
 };
@@ -1409,4 +1518,6 @@ module.exports = {
   getUserActivityFeed,
   getUpcomingUserObligations,
   purgeUserAllData,
+  isPathInsideDirectory,
+  resolveDocFullText,
 };

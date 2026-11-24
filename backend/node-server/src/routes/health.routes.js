@@ -199,9 +199,9 @@ router.get('/diagnostics', async (req, res) => {
       storage: {
         disk: diskMetrics,
         paths: {
-          storageDir: path.resolve(__dirname, '../../../../storage'),
-          faissDir: path.resolve(__dirname, '../../../../faiss_indexes'),
-          reportsDir: path.resolve(__dirname, '../../../../reports'),
+          storageDir: config.STORAGE_DIR,
+          faissDir:   config.FAISS_DIR,
+          reportsDir: config.REPORTS_DIR,
         },
         records: {
           activeDocuments: docCount,

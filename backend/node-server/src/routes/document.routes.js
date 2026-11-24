@@ -91,5 +91,6 @@ router.delete('/:id', requireDocumentOwnership, removeDocument);
 // Part 11 — Document Q&A (RAG)
 router.post('/:id/chat', requireDocumentOwnership, chatWithDocument);
 router.get('/:id/chat', requireDocumentOwnership, getChatHistory);
+router.get('/:id/chat-history', requireDocumentOwnership, getChatHistory);
 
 module.exports = router;

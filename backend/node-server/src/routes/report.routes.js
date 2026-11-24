@@ -3,6 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/auth.middleware');
+const { requireDocumentOwnership } = require('../middleware/ownership.middleware');
 const {
   generateReport,
   listReports,
@@ -13,7 +14,7 @@ const {
 router.use(protect);
 
 router.get('/', listReports);
-router.post('/generate/:id', generateReport); // id = documentId
+router.post('/generate/:id', requireDocumentOwnership, generateReport); // id = documentId
 router.get('/:id/download', downloadReport);
 router.delete('/:id', deleteReport);
 

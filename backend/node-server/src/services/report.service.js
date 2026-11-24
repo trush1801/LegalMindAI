@@ -10,8 +10,9 @@ const AnalysisResult = require('../models/AnalysisResult.model');
 const RiskFinding = require('../models/RiskFinding.model');
 const ChatHistory = require('../models/ChatHistory.model');
 const Report = require('../models/Report.model');
+const config = require('../config/env');
 
-const REPORTS_DIR = path.resolve(__dirname, '../../../../reports');
+const REPORTS_DIR = config.REPORTS_DIR;
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
 // ─── Palette ──────────────────────────────────────────────────────────────
@@ -132,83 +133,9 @@ function smartPageBreak(doc, neededHeight = 150) {
   }
 }
 
-// ─── Cross-Report Consistency Validator ───────────────────────────────────
-function validateCrossReportConsistency(metadata, analysis, risk) {
-  const issues = [];
-  const warnings = [];
-
-  const missingProvs = analysis?.missingProvisions || [];
-  const riskFindings = risk?.flaggedClauses || risk?.findings || [];
-  const clauses = analysis?.clauses || [];
-  const obligations = analysis?.structuredObligations || [];
-  const structuredDates = analysis?.structuredDates || [];
-
-  // 1. Warranty consistency between Risk Analysis and Missing Provisions
-  missingProvs.forEach((p) => {
-    const pName = (p.provision_name || p.name || '').toLowerCase();
-    const pStr = JSON.stringify(p).toLowerCase();
-    if (pName.includes('warranty')) {
-      if (pStr.includes('30-day warranty') || String(p.actual_section_number) === '10') {
-        issues.push({
-          rule: 'WARRANTY_CONTRADICTION',
-          finding: p.provision_name || p.name,
-          sourceSection: p.actual_section_number,
-          message: 'Contradiction: Provision incorrectly cites a 30-day warranty in Section 10. Section 10 is IP; Section 12 governs Warranties.',
-        });
-      }
-      if (p.actual_section_number && !['12', 12, '12 & 7'].includes(p.actual_section_number)) {
-        issues.push({
-          rule: 'WARRANTY_SECTION_MISMATCH',
-          finding: p.provision_name || p.name,
-          sourceSection: p.actual_section_number,
-          message: `Warranty provision cites Section ${p.actual_section_number} instead of Section 12 (Warranties and Disclaimers).`,
-        });
-      }
-    }
-  });
-
-  riskFindings.forEach((f) => {
-    const fStr = JSON.stringify(f).toLowerCase();
-    if (fStr.includes('30-day warranty')) {
-      issues.push({
-        rule: 'WARRANTY_CONTRADICTION',
-        finding: f.riskTitle || f.title || f.clauseType,
-        sourceSection: f.section,
-        message: 'Contradiction: Risk finding refers to fabricated 30-day warranty.',
-      });
-    }
-  });
-
-  // 2. Confidentiality Survival consistency
-  missingProvs.forEach((p) => {
-    const pName = (p.provision_name || p.name || '').toLowerCase();
-    if (pName.includes('confidentiality')) {
-      if (p.actual_section_number && !['9', 9].includes(p.actual_section_number)) {
-        issues.push({
-          rule: 'CONFIDENTIALITY_SECTION_MISMATCH',
-          finding: p.provision_name || p.name,
-          sourceSection: p.actual_section_number,
-          message: `Confidentiality cites Section ${p.actual_section_number} instead of Section 9.`,
-        });
-      }
-    }
-  });
-
-  obligations.forEach((o) => {
-    if ((o.obligation || '').toLowerCase().includes('confidential')) {
-      if (o.deadline && o.deadline.toLowerCase().includes('following termination')) {
-        warnings.push({
-          rule: 'CONFIDENTIALITY_SURVIVAL_UNSUPPORTED',
-          finding: o.obligation,
-          sourceSection: o.section_reference,
-          message: 'Section 9 contains no post-termination survival language; deadline should specify not stated in agreement.',
-        });
-      }
-    }
-  });
-
-  // 3. Section References consistency mapping
-  const expectedSectionMap = {
+// ─── Category-Aware Legal Section Taxonomy ────────────────────────────────
+const CATEGORY_SECTION_MAPS = {
+  software_development_agreement: {
     'deliverables': ['3'],
     'intellectual property': ['10'],
     'data protection': ['11'],
@@ -219,24 +146,250 @@ function validateCrossReportConsistency(metadata, analysis, risk) {
     'client responsibilities': ['6'],
     'fees and payment': ['5'],
     'term and termination': ['14'],
-  };
+  },
+  employment_nda: {
+    'confidentiality': ['4', '5'],
+    'security': ['7'],
+    'personal data': ['8'],
+    'company property': ['9'],
+    'intellectual property': ['9'],
+    'return of materials': ['10'],
+    'term and termination': ['11'],
+    'notices': ['14'],
+    'governing law': ['15'],
+    'dispute resolution': ['15', '16'],
+  },
+  employment_agreement: {
+    'duties': ['1'],
+    'compensation': ['2'],
+    'term and termination': ['3'],
+    'confidentiality': ['4'],
+    'restrictive covenants': ['5'],
+    'governing law': ['5', '6'],
+  },
+  commercial_lease: {
+    'premises': ['1', '2'],
+    'lease term': ['2'],
+    'rent': ['3'],
+    'deposit': ['4'],
+    'maintenance': ['5'],
+    'subletting': ['6'],
+    'termination': ['7'],
+    'governing law': ['8'],
+  },
+  loan_agreement: {
+    'facility': ['1'],
+    'interest': ['2'],
+    'repayment': ['3'],
+    'prepayment': ['4'],
+    'default': ['5'],
+    'governing law': ['6'],
+  },
+  shareholders_agreement: {
+    'shares': ['2', '3'],
+    'governance': ['4'],
+    'transfer': ['5'],
+    'preemption': ['6'],
+    'dispute': ['7'],
+  },
+  privacy_policy: {
+    'data collection': ['1', '2'],
+    'usage': ['2', '3'],
+    'cookies': ['3', '4'],
+    'rights': ['4', '5'],
+    'security': ['5', '6'],
+  },
+  generic_contract: {},
+};
 
-  missingProvs.forEach((p) => {
-    const pName = (p.provision_name || p.name || '').toLowerCase();
-    for (const [key, expectedSecs] of Object.entries(expectedSectionMap)) {
-      if (pName.includes(key) && p.actual_section_number && p.actual_section_number !== 'None') {
-        const secStr = String(p.actual_section_number);
-        if (!expectedSecs.some((s) => secStr.includes(s))) {
+function detectDocumentCategory(metadata, analysis, risk, document) {
+  const candidates = [
+    document?.documentSubtype,
+    document?.documentType,
+    analysis?.classification?.subtype,
+    analysis?.classification?.predicted_type,
+    analysis?.classification?.primary_category,
+    analysis?.documentType,
+    metadata?.documentType,
+    document?.originalName,
+    document?.title,
+  ].filter(Boolean).map((s) => String(s).toLowerCase());
+
+  const fullStr = candidates.join(' ');
+
+  if (
+    fullStr.includes('employment nda') ||
+    fullStr.includes('non-disclosure') ||
+    fullStr.includes('confidentiality agreement') ||
+    (fullStr.includes('nda') && fullStr.includes('employment'))
+  ) {
+    return 'employment_nda';
+  }
+  if (
+    fullStr.includes('software development') ||
+    fullStr.includes('sdsa') ||
+    fullStr.includes('services agreement') ||
+    fullStr.includes('master services agreement') ||
+    fullStr.includes('software services')
+  ) {
+    return 'software_development_agreement';
+  }
+  if (
+    fullStr.includes('employment agreement') ||
+    fullStr.includes('employment contract') ||
+    fullStr.includes('offer letter')
+  ) {
+    return 'employment_agreement';
+  }
+  if (
+    fullStr.includes('commercial lease') ||
+    fullStr.includes('lease agreement') ||
+    fullStr.includes('tenancy')
+  ) {
+    return 'commercial_lease';
+  }
+  if (
+    fullStr.includes('loan agreement') ||
+    fullStr.includes('credit agreement') ||
+    fullStr.includes('promissory note') ||
+    fullStr.includes('facility agreement')
+  ) {
+    return 'loan_agreement';
+  }
+  if (
+    fullStr.includes('shareholder') ||
+    fullStr.includes('stockholders') ||
+    fullStr.includes('equity holders')
+  ) {
+    return 'shareholders_agreement';
+  }
+  if (
+    fullStr.includes('privacy policy') ||
+    fullStr.includes('data privacy') ||
+    fullStr.includes('gdpr policy')
+  ) {
+    return 'privacy_policy';
+  }
+  return 'generic_contract';
+}
+
+// ─── Cross-Report Consistency Validator ───────────────────────────────────
+function validateCrossReportConsistency(metadata, analysis, risk, document = null) {
+  const issues = [];
+  const warnings = [];
+
+  const category = detectDocumentCategory(metadata, analysis, risk, document);
+  const expectedSectionMap = CATEGORY_SECTION_MAPS[category] || {};
+
+  const missingProvs = analysis?.missingProvisions || [];
+  const riskFindings = risk?.flaggedClauses || risk?.findings || [];
+  const clauses = analysis?.clauses || [];
+  const obligations = analysis?.structuredObligations || [];
+  const structuredDates = analysis?.structuredDates || [];
+
+  // 1. Warranty consistency: only enforce SDSA warranty rules on software_development_agreement
+  if (category === 'software_development_agreement') {
+    missingProvs.forEach((p) => {
+      const pName = (p.provision_name || p.name || '').toLowerCase();
+      const pStr = JSON.stringify(p).toLowerCase();
+      if (pName.includes('warranty')) {
+        if (pStr.includes('30-day warranty') || String(p.actual_section_number) === '10') {
           issues.push({
-            rule: 'SECTION_REFERENCE_MISMATCH',
+            rule: 'WARRANTY_CONTRADICTION',
             finding: p.provision_name || p.name,
             sourceSection: p.actual_section_number,
-            message: `Expected Section ${expectedSecs.join('/')} for ${key}, but found Section ${p.actual_section_number}.`,
+            message: 'Contradiction: Provision incorrectly cites a 30-day warranty in Section 10. Section 10 is IP; Section 12 governs Warranties.',
+          });
+        }
+        if (p.actual_section_number && !['12', 12, '12 & 7'].includes(p.actual_section_number)) {
+          issues.push({
+            rule: 'WARRANTY_SECTION_MISMATCH',
+            finding: p.provision_name || p.name,
+            sourceSection: p.actual_section_number,
+            message: `Warranty provision cites Section ${p.actual_section_number} instead of Section 12 (Warranties and Disclaimers).`,
           });
         }
       }
-    }
-  });
+    });
+
+    riskFindings.forEach((f) => {
+      const fStr = JSON.stringify(f).toLowerCase();
+      if (fStr.includes('30-day warranty')) {
+        issues.push({
+          rule: 'WARRANTY_CONTRADICTION',
+          finding: f.riskTitle || f.title || f.clauseType,
+          sourceSection: f.section,
+          message: 'Contradiction: Risk finding refers to fabricated 30-day warranty.',
+        });
+      }
+    });
+
+    // SDSA Confidentiality Survival consistency (Section 9)
+    missingProvs.forEach((p) => {
+      const pName = (p.provision_name || p.name || '').toLowerCase();
+      if (pName.includes('confidentiality')) {
+        if (p.actual_section_number && !['9', 9].includes(p.actual_section_number)) {
+          issues.push({
+            rule: 'CONFIDENTIALITY_SECTION_MISMATCH',
+            finding: p.provision_name || p.name,
+            sourceSection: p.actual_section_number,
+            message: `Confidentiality cites Section ${p.actual_section_number} instead of Section 9.`,
+          });
+        }
+      }
+    });
+
+    obligations.forEach((o) => {
+      if ((o.obligation || '').toLowerCase().includes('confidential')) {
+        if (o.deadline && o.deadline.toLowerCase().includes('following termination')) {
+          warnings.push({
+            rule: 'CONFIDENTIALITY_SURVIVAL_UNSUPPORTED',
+            finding: o.obligation,
+            sourceSection: o.section_reference,
+            message: 'Section 9 contains no post-termination survival language; deadline should specify not stated in agreement.',
+          });
+        }
+      }
+    });
+  } else if (category === 'employment_nda') {
+    // Employment NDA specific section checks
+    missingProvs.forEach((p) => {
+      const pName = (p.provision_name || p.name || '').toLowerCase();
+      if (pName.includes('confidentiality')) {
+        if (p.actual_section_number && !['4', '5', 4, 5].includes(p.actual_section_number)) {
+          issues.push({
+            rule: 'CONFIDENTIALITY_SECTION_MISMATCH',
+            finding: p.provision_name || p.name,
+            sourceSection: p.actual_section_number,
+            message: `Confidentiality cites Section ${p.actual_section_number} instead of Section 4 or 5.`,
+          });
+        }
+      }
+    });
+  }
+
+  // 3. Section References consistency mapping (Category-Aware)
+  if (Object.keys(expectedSectionMap).length > 0) {
+    missingProvs.forEach((p) => {
+      const pName = (p.provision_name || p.name || '').toLowerCase();
+      for (const [key, expectedSecs] of Object.entries(expectedSectionMap)) {
+        if (key === 'term' && (pName.includes('payment') || pName.includes('rent') || pName.includes('price'))) {
+          continue;
+        }
+        if (pName.includes(key) && p.actual_section_number && p.actual_section_number !== 'None') {
+          const secStr = String(p.actual_section_number);
+          if (!expectedSecs.some((s) => secStr.includes(s))) {
+            issues.push({
+              rule: 'SECTION_REFERENCE_MISMATCH',
+              finding: p.provision_name || p.name,
+              sourceSection: p.actual_section_number,
+              message: `Expected Section ${expectedSecs.join('/')} for ${key}, but found Section ${p.actual_section_number}.`,
+            });
+          }
+        }
+      }
+    });
+  }
 
   // 4. Dates & Durations semantics
   structuredDates.forEach((d) => {
@@ -299,6 +452,7 @@ function validateCrossReportConsistency(metadata, analysis, risk) {
 
   return {
     passed: issues.length === 0,
+    category,
     issues,
     warnings,
   };
@@ -324,7 +478,7 @@ async function generateDocumentReport(documentId, userId) {
   ]);
 
   // Pre-generation Cross-Report Consistency Validation
-  const consistencyReport = validateCrossReportConsistency(metadata, analysis, risk);
+  const consistencyReport = validateCrossReportConsistency(metadata, analysis, risk, document);
   if (!consistencyReport.passed || consistencyReport.warnings.length > 0) {
     consistencyReport.issues.forEach((iss) => {
       console.warn(`[CROSS-REPORT ISSUE] [${iss.rule}] ${iss.finding} (Sec ${iss.sourceSection}): ${iss.message}`);
@@ -401,7 +555,10 @@ async function renderReportPdf({ document, metadata, analysis, risk, chat, fileP
   infoRow(doc, 'Uploaded', new Date(document.createdAt).toLocaleString());
   infoRow(doc, 'Processing Status', document.processingStatus);
   if (metadata) {
-    infoRow(doc, 'Pages', metadata.pageCount);
+    const pagesDisplay = metadata.pageCountIsEstimated
+      ? `${metadata.estimatedPageCount || metadata.pageCount} (estimated)`
+      : `${metadata.pageCount || 1}`;
+    infoRow(doc, 'Pages', pagesDisplay);
     const analyzedWords = metadata.wordCount || 1295;
     const rawWords = metadata.rawWordCount ? `${analyzedWords} (Analyzed) / ${metadata.rawWordCount} (Raw Document)` : `${analyzedWords} words`;
     infoRow(doc, 'Word Count', rawWords);
@@ -909,6 +1066,9 @@ async function listUserReports(userId) {
 }
 
 async function downloadReport(reportId, userId) {
+  if (!reportId || !mongoose.Types.ObjectId.isValid(reportId)) {
+    throw { status: 400, message: 'Invalid report ID format.' };
+  }
   const report = await Report.findById(reportId);
   if (!report) throw { status: 404, message: 'Report not found.' };
   if (String(report.userId) !== String(userId)) throw { status: 403, message: 'Access denied.' };
@@ -921,12 +1081,18 @@ async function downloadReport(reportId, userId) {
 }
 
 async function deleteReport(reportId, userId) {
+  if (!reportId || !mongoose.Types.ObjectId.isValid(reportId)) {
+    throw { status: 400, message: 'Invalid report ID format.' };
+  }
   const report = await Report.findById(reportId);
   if (!report) throw { status: 404, message: 'Report not found.' };
   if (String(report.userId) !== String(userId)) throw { status: 403, message: 'Access denied.' };
 
   if (fs.existsSync(report.filePath)) {
-    fs.unlinkSync(report.filePath);
+    const { isPathInsideDirectory } = require('./document.service');
+    if (isPathInsideDirectory(REPORTS_DIR, report.filePath)) {
+      fs.unlinkSync(report.filePath);
+    }
   }
   await Report.findByIdAndDelete(reportId);
   return { success: true };
@@ -939,4 +1105,6 @@ module.exports = {
   downloadReport,
   deleteReport,
   validateCrossReportConsistency,
+  detectDocumentCategory,
+  CATEGORY_SECTION_MAPS,
 };

@@ -6,6 +6,7 @@ const multer = require('multer');
 const path   = require('path');
 const fs     = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const config = require('../config/env');
 
 // ── Allowed file types ────────────────────────────────────
 const ALLOWED_MIME_TYPES = {
@@ -21,7 +22,7 @@ const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 // ── Ensure storage directory exists ──────────────────────
 const getStorageDir = () => {
-  const storageDir = path.resolve(__dirname, '../../../../../storage');
+  const storageDir = config.STORAGE_DIR;
   if (!fs.existsSync(storageDir)) {
     fs.mkdirSync(storageDir, { recursive: true });
   }
@@ -33,8 +34,9 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const storageDir = getStorageDir();
 
-    // Create user-specific subfolder
-    const userDir = path.join(storageDir, req.user._id.toString());
+    // Create user-specific subfolder safely
+    const safeUserId = String(req.user._id).replace(/[^a-zA-Z0-9_-]/g, '');
+    const userDir = path.join(storageDir, safeUserId);
     if (!fs.existsSync(userDir)) {
       fs.mkdirSync(userDir, { recursive: true });
     }

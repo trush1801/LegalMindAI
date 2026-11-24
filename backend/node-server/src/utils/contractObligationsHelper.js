@@ -5,6 +5,7 @@
 // ============================================================
 
 const fs = require('fs');
+const path = require('path');
 
 /**
  * Normalizes text and whitespace
@@ -14,8 +15,55 @@ function cleanText(text) {
   return text.replace(/\r\n/g, '\n').replace(/\t/g, ' ').replace(/ +/g, ' ').trim();
 }
 
+const MONTH_MAP = {
+  january: 1, jan: 1,
+  february: 2, feb: 2,
+  march: 3, mar: 3,
+  april: 4, apr: 4,
+  may: 5,
+  june: 6, jun: 6,
+  july: 7, jul: 7,
+  august: 8, aug: 8,
+  september: 9, sep: 9, sept: 9,
+  october: 10, oct: 10,
+  november: 11, nov: 11,
+  december: 12, dec: 12,
+};
+
 /**
- * Attempts to parse human legal dates into ISO Date objects
+ * Normalizes awkward contract terms for display (e.g. "thirty 30 days" -> "30 Days")
+ * without modifying verbatim contract source passage or supporting evidence.
+ */
+function normalizeDisplayTerms(str) {
+  if (!str || typeof str !== 'string') return str;
+  const WORD_TO_NUM = {
+    one: '1', two: '2', three: '3', four: '4', five: '5',
+    six: '6', seven: '7', eight: '8', nine: '9', ten: '10',
+    twelve: '12', fifteen: '15', twenty: '20', thirty: '30',
+    forty: '40', fortyfive: '45', fifty: '50', sixty: '60',
+    ninety: '90', hundred: '100',
+  };
+  let res = str;
+  // Replace word-digit duplicates like "thirty (30) days" or "thirty 30 days" with "30 Days"
+  res = res.replace(/\b([a-zA-Z]+)\s*\(?(\d+)\)?\s*(business\s+|calendar\s+)?(days?|months?|years?|weeks?|hours?)\b/gi, (m, word, num, type, unit) => {
+    const wLow = word.toLowerCase();
+    if (WORD_TO_NUM[wLow] && (WORD_TO_NUM[wLow] === num || WORD_TO_NUM[wLow])) {
+      const u = unit.charAt(0).toUpperCase() + unit.slice(1).toLowerCase();
+      const t = type ? (type.trim().charAt(0).toUpperCase() + type.trim().slice(1).toLowerCase() + ' ') : '';
+      return `${num} ${t}${u}`;
+    }
+    return m;
+  });
+  // Clean up remaining duplicates like "thirty 30"
+  res = res.replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten|twelve|fifteen|twenty|thirty|forty|fifty|sixty|ninety)\s+(\d+)\b/gi, '$2');
+  // Capitalize "Net 30 Days"
+  res = res.replace(/\bnet\s+(\d+)\s*days?\b/gi, 'Net $1 Days');
+  return res.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Robustly parses legal calendar dates into timezone-independent UTC Date objects.
+ * Prevents UTC/local midnight drift (e.g. Oct 15 shifting to Oct 14 in GMT+05:30).
  */
 function parseCalendarDate(str) {
   if (!str || typeof str !== 'string') return null;
@@ -24,14 +72,62 @@ function parseCalendarDate(str) {
     .replace(/[()]/g, '')
     .trim();
 
-  const timestamp = Date.parse(cleaned);
-  if (!isNaN(timestamp)) {
-    const d = new Date(timestamp);
-    // Sanity check year between 1990 and 2100
-    if (d.getFullYear() >= 1990 && d.getFullYear() <= 2100) {
-      return d;
+  // 1. ISO format: YYYY-MM-DD
+  const isoMatch = cleaned.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (isoMatch) {
+    const y = parseInt(isoMatch[1], 10);
+    const m = parseInt(isoMatch[2], 10);
+    const d = parseInt(isoMatch[3], 10);
+    if (y >= 1990 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
     }
   }
+
+  // 2. Month Day, Year (e.g. October 15, 2024 or Oct 15 2024)
+  const mdyMatch = cleaned.match(/^([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (mdyMatch) {
+    const m = MONTH_MAP[mdyMatch[1].toLowerCase()];
+    const d = parseInt(mdyMatch[2], 10);
+    const y = parseInt(mdyMatch[3], 10);
+    if (m && y >= 1990 && y <= 2100 && d >= 1 && d <= 31) {
+      return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+    }
+  }
+
+  // 3. Day Month Year (e.g. 15 October 2024)
+  const dmyMatch = cleaned.match(/^(\d{1,2})\s+([a-zA-Z]+),?\s+(\d{4})$/);
+  if (dmyMatch) {
+    const d = parseInt(dmyMatch[1], 10);
+    const m = MONTH_MAP[dmyMatch[2].toLowerCase()];
+    const y = parseInt(dmyMatch[3], 10);
+    if (m && y >= 1990 && y <= 2100 && d >= 1 && d <= 31) {
+      return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+    }
+  }
+
+  // 4. Substring Month Day, Year (e.g. "terminates on October 14, 2026")
+  const subMatch = cleaned.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  if (subMatch) {
+    const m = MONTH_MAP[subMatch[1].toLowerCase()];
+    const d = parseInt(subMatch[2], 10);
+    const y = parseInt(subMatch[3], 10);
+    if (m && y >= 1990 && y <= 2100 && d >= 1 && d <= 31) {
+      return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+    }
+  }
+
+  // 5. Fallback via Date.parse
+  const ts = Date.parse(cleaned);
+  if (!isNaN(ts)) {
+    const localD = new Date(ts);
+    const y = localD.getFullYear();
+    const m = localD.getMonth() + 1;
+    const d = localD.getDate();
+    if (y >= 1990 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+    }
+  }
+
   return null;
 }
 
@@ -39,8 +135,20 @@ function parseCalendarDate(str) {
  * Formats a Date object cleanly as YYYY-MM-DD
  */
 function toIsoDate(d) {
-  if (!d || !(d instanceof Date) || isNaN(d.getTime())) return null;
-  return d.toISOString().split('T')[0];
+  if (!d) return null;
+  if (typeof d === 'string') {
+    const m = d.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    const p = parseCalendarDate(d);
+    return p ? toIsoDate(p) : null;
+  }
+  if (d instanceof Date && !isNaN(d.getTime())) {
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return null;
 }
 
 /**
@@ -52,20 +160,35 @@ function toIsoDate(d) {
  * @returns {Object} Structured timeline, categorized obligations, and summary telemetry
  */
 function extractContractObligations(document, analysis, metadata) {
-  // 1. Resolve full document text
+  // 1. Resolve full document text safely without parsing binary files (Phase 1D — ERR-CRIT-004)
   let rawText = '';
-  if (document.filePath && fs.existsSync(document.filePath)) {
+  const docObj = document || {};
+  const filePath = docObj.filePath || '';
+  const fileExt = path.extname(filePath).toLowerCase();
+  const isPlainText = fileExt === '.txt';
+
+  // 1a. If supported plain-text file exists on disk, reading is valid
+  if (isPlainText && filePath && fs.existsSync(filePath)) {
     try {
-      rawText = fs.readFileSync(document.filePath, 'utf8');
+      rawText = fs.readFileSync(filePath, 'utf8');
     } catch {
-      // fallback
+      rawText = '';
     }
   }
-  if (!rawText && metadata && metadata.extractedText) {
+
+  // 1b. For non-plain-text (PDF, DOCX) or unreadable files, prefer metadata.extractedText
+  if (!rawText && metadata && typeof metadata.extractedText === 'string' && metadata.extractedText.trim()) {
     rawText = metadata.extractedText;
   }
-  if (!rawText && analysis && analysis.summary && analysis.summary.fullSummary) {
-    rawText = analysis.summary.fullSummary;
+
+  // 1c. If metadata.extractedText is empty, reconstruct from extracted clauses
+  if (!rawText && analysis && Array.isArray(analysis.clauses) && analysis.clauses.length > 0) {
+    rawText = analysis.clauses.map((c) => c.text || '').filter(Boolean).join('\n\n');
+  }
+
+  // 1d. Fallback to summary if available
+  if (!rawText && analysis && analysis.summary) {
+    rawText = analysis.summary.fullSummary || analysis.summary.overview || '';
   }
 
   const cleanedDocText = cleanText(rawText);
@@ -82,8 +205,9 @@ function extractContractObligations(document, analysis, metadata) {
   // 1. CONTRACT START DATE / EFFECTIVE DATE
   // ────────────────────────────────────────────────────────────
   const startDateRegexes = [
-    /(?:entered\s+into\s+as\s+of|effective\s+(?:as\s+of|date:?)|commencing\s+on|dated\s+as\s+of|agreement\s+date:?)\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{4}|\d{4}-\d{2}-\d{2})/i,
+    /(?:entered\s+into\s+(?:as\s+of|on)|effective\s+(?:as\s+of|date:?|from)|commencing\s+on|dated\s+(?:as\s+of|on)?|agreement\s+date:?|made\s+and\s+entered\s+into\s+(?:as\s+of|on)?|executed\s+(?:as\s+of|on)?)\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{4}|\d{4}-\d{2}-\d{2})/i,
     /(?:as\s+of\s+this\s+)(\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+[A-Za-z]+,?\s+\d{4})/i,
+    /(?:this\s+\d{1,2}(?:st|nd|rd|th)?\s+day\s+of\s+[A-Za-z]+,?\s+\d{4})/i,
   ];
 
   let foundStartDate = null;
@@ -105,6 +229,27 @@ function extractContractObligations(document, analysis, metadata) {
           sentenceEnd !== -1 ? sentenceEnd : matchIdx + 200
         ).trim();
         break;
+      }
+    }
+  }
+
+  // Fallback to NER keyDates or structuredDates if not matched in preamble text
+  if (!foundStartDate && analysis) {
+    const candidateDates = [
+      ...(Array.isArray(analysis.keyDates) ? analysis.keyDates : []),
+      ...(Array.isArray(analysis.structuredDates) ? analysis.structuredDates : []),
+    ];
+    for (const kd of candidateDates) {
+      const lbl = (kd.label || kd.date_text || kd.date || '').toLowerCase();
+      if (/start|effective|commence|commencing|agreement\s*date/i.test(lbl)) {
+        const rawD = kd.date || kd.date_text || kd.parsedDate;
+        const parsed = parseCalendarDate(rawD);
+        if (parsed) {
+          foundStartDate = rawD;
+          startDateObj = parsed;
+          startExcerpt = `Identified from contract records: ${lbl} (${rawD})`;
+          break;
+        }
       }
     }
   }
@@ -149,9 +294,9 @@ function extractContractObligations(document, analysis, metadata) {
   // 2. EXPIRATION DATE / INITIAL TERM
   // ────────────────────────────────────────────────────────────
   const termDurationRegexes = [
-    /(?:initial\s+term\s+(?:is|shall\s+be)|term\s+of\s+(?:this\s+agreement\s+is|the\s+agreement\s+is|employment\s+is)|period\s+of)\s*(\d+)\s*(months?|years?|days?)/i,
-    /(?:shall\s+continue\s+in\s+effect\s+for\s*(?:a\s+period\s+of\s*)?)(\d+)\s*(months?|years?|days?)/i,
-    /(?:for\s+an\s+initial\s+period\s+of)\s*(\d+)\s*(months?|years?)/i,
+    /(?:initial\s+term\s+(?:is|shall\s+be|of)|term\s+of\s+(?:this\s+agreement\s+is|the\s+agreement\s+is|employment\s+is)|period\s+of)\s*(?:[a-zA-Z]+\s*\()?\s*(\d+)\s*\)?\s*(months?|years?|days?)/i,
+    /(?:shall\s+continue\s+in\s+effect\s+for\s*(?:a\s+period\s+of\s*)?)(?:[a-zA-Z]+\s*\()?\s*(\d+)\s*\)?\s*(months?|years?|days?)/i,
+    /(?:for\s+an\s+initial\s+period\s+of)\s*(?:[a-zA-Z]+\s*\()?\s*(\d+)\s*\)?\s*(months?|years?)/i,
   ];
 
   let termDurationText = null;
@@ -175,7 +320,7 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   // Also check explicit calendar expiration dates
-  const explicitExpiryRegex = /(?:shall\s+expire\s+on|shall\s+terminate\s+on|expiration\s+date\s*:?)\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{4}-\d{2}-\d{2})/i;
+  const explicitExpiryRegex = /(?:shall\s+expire\s+on|shall\s+terminate\s+on|expiring\s+on|expires\s+on|expiration\s+date\s*:?|until)\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{4}-\d{2}-\d{2})/i;
   const explicitExpiryMatch = cleanedDocText.match(explicitExpiryRegex);
 
   if (explicitExpiryMatch && parseCalendarDate(explicitExpiryMatch[1])) {
@@ -263,19 +408,29 @@ function extractContractObligations(document, analysis, metadata) {
   // ────────────────────────────────────────────────────────────
   // 3. RENEWAL DATES & EXTENSION WINDOWS
   // ────────────────────────────────────────────────────────────
-  const renewalRegex = /(?:automatic(?:ally)?\s+renew|renewal\s+term|renewed\s+for\s+successive\s+periods|option\s+to\s+renew|extend\s+this\s+agreement)[^.\n]{0,250}\./i;
+  const renewalRegex = /(?:automatic(?:ally)?\s+renew|renewal\s+term|renewed\s+for\s+successive\s+periods|option\s+to\s+renew|extend\s+this\s+agreement)[^.]{0,350}\./i;
   const renewalMatch = cleanedDocText.match(renewalRegex);
 
   if (renewalMatch) {
     // Check if notice window specified for non-renewal
-    const renewalNoticeMatch = renewalMatch[0].match(/(\d+)\s*(days?|months?)/i);
-    const renewalNotice = renewalNoticeMatch ? `${renewalNoticeMatch[1]} ${renewalNoticeMatch[2]}` : 'Advance Notice';
+    const renewalNoticeMatch = renewalMatch[0].match(/(?:notice[^.]{0,40}?|at\s+least\s+)(?:([a-zA-Z]+)\s*\(([0-9]+)\)|(\d+|[a-zA-Z]+))\s*(?:business\s+)?(days?|months?)/i);
+    let renewalNotice = 'Advance Notice';
+    if (renewalNoticeMatch) {
+      const num = renewalNoticeMatch[2] || renewalNoticeMatch[3] || renewalNoticeMatch[1];
+      const unit = renewalNoticeMatch[4];
+      renewalNotice = `${num} ${unit}`;
+    } else {
+      const fallback = renewalMatch[0].match(/(\d+)\s*(days?|months?)/i);
+      if (fallback) renewalNotice = `${fallback[1]} ${fallback[2]}`;
+    }
+
+    const cleanRenewalNotice = normalizeDisplayTerms(renewalNotice);
 
     items.push({
       id: 'ob-renewal-window',
       category: 'RENEWAL_DATE',
       title: 'Contract Automatic Renewal / Extension',
-      date: `Successive Terms (Notice: ${renewalNotice})`,
+      date: `Successive Terms (Notice: ${cleanRenewalNotice})`,
       parsedDate: null,
       dateType: 'conditional_trigger',
       certainty: 'CONDITIONAL',
@@ -293,9 +448,11 @@ function extractContractObligations(document, analysis, metadata) {
   // 4. NOTICE PERIODS (TERMINATION FOR CONVENIENCE)
   // ────────────────────────────────────────────────────────────
   const noticeRegexes = [
-    /(?:either\s+party\s+may\s+terminate[^.\n]{0,100}?(?:providing|delivering|with)\s+([a-zA-Z0-9\(\)\s]+?\s*(?:business\s+)?days?|[a-zA-Z0-9\(\)\s]+?\s*months?)\s+(?:advance\s+)?written\s+notice)/i,
+    /(?:either\s+party\s+may\s+terminate[^.]{0,120}?(?:providing|delivering|with|upon)\s+([a-zA-Z0-9\(\)\s]+?\s*(?:business\s+)?days?|[a-zA-Z0-9\(\)\s]+?\s*months?)\s+(?:advance\s+)?written\s+notice)/i,
     /(?:notice\s+period\s+of\s+([a-zA-Z0-9\(\)\s]+?\s*days?|[a-zA-Z0-9\(\)\s]+?\s*months?))/i,
     /(?:terminated\s+with\s+([a-zA-Z0-9\(\)\s]+?\s*days?|[a-zA-Z0-9\(\)\s]+?\s*months?)\s+notice)/i,
+    /(?:written\s+notice[^.]{0,80}?(?:at\s+least\s+)?([a-zA-Z0-9\(\)\s]+?\s*(?:business\s+)?days?|[a-zA-Z0-9\(\)\s]+?\s*months?)\s+prior)/i,
+    /(?:at\s+least\s+([a-zA-Z0-9\(\)\s]+?\s*(?:business\s+)?days?|[a-zA-Z0-9\(\)\s]+?\s*months?)[^.]{0,80}?written\s+notice)/i,
     /(?:(\d+)\s*days?\s+(?:advance\s+)?written\s+notice)/i,
   ];
 
@@ -315,15 +472,16 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   if (foundNotice) {
+    const cleanNotice = normalizeDisplayTerms(foundNotice);
     items.push({
       id: 'ob-notice-period',
       category: 'NOTICE_PERIOD',
       title: 'Termination for Convenience Notice Period',
-      date: `${foundNotice} Written Notice`,
+      date: `${cleanNotice} Written Notice`,
       parsedDate: null,
       dateType: 'relative_duration',
-      certainty: 'EXPLICIT',
-      uncertaintyReason: null,
+      certainty: 'INFERRED',
+      uncertaintyReason: 'Requires delivery of written notice prior to desired termination date.',
       sourcePassage: noticePassage || `Termination requires ${foundNotice} written notice.`,
       page: 1,
       section: 'Termination',
@@ -337,7 +495,7 @@ function extractContractObligations(document, analysis, metadata) {
   // 5. TERMINATION DEADLINES & IMMEDIATE CURE PERIODS
   // ────────────────────────────────────────────────────────────
   // Immediate termination / cause
-  const causeRegex = /(?:immediate\s+termination|terminate\s+immediately)[^.\n]{0,200}\./i;
+  const causeRegex = /(?:immediate\s+termination|terminate\s+immediately)[^.]{0,200}\./i;
   const causeMatch = cleanedDocText.match(causeRegex);
   if (causeMatch) {
     items.push({
@@ -347,7 +505,7 @@ function extractContractObligations(document, analysis, metadata) {
       date: 'Immediate / Upon Notice',
       parsedDate: null,
       dateType: 'conditional_trigger',
-      certainty: 'EXPLICIT',
+      certainty: 'CONDITIONAL',
       uncertaintyReason: 'Immediate termination without notice period applies exclusively upon occurrence of specified cause events.',
       sourcePassage: causeMatch[0].trim(),
       page: 1,
@@ -359,10 +517,10 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   // Overdue payment suspension / cure period
-  const cureRegex = /(?:suspend\s+services|cure\s+period|remedy\s+such\s+breach)[^.\n]{0,60}?(\d+\s*(?:business\s+)?days?)/i;
+  const cureRegex = /(?:suspend\s+services|cure\s+period|remedy\s+such\s+breach)[^.]{0,60}?(\d+\s*(?:business\s+)?days?)/i;
   const cureMatch = cleanedDocText.match(cureRegex);
   if (cureMatch) {
-    const cureWindow = cureMatch[1];
+    const cureWindow = normalizeDisplayTerms(cureMatch[1]);
     items.push({
       id: 'ob-cure-period',
       category: 'TERMINATION_DEADLINE',
@@ -370,7 +528,7 @@ function extractContractObligations(document, analysis, metadata) {
       date: `${cureWindow} Cure Period`,
       parsedDate: null,
       dateType: 'relative_duration',
-      certainty: 'EXPLICIT',
+      certainty: 'INFERRED',
       uncertaintyReason: null,
       sourcePassage: cureMatch[0].trim(),
       page: 1,
@@ -385,12 +543,13 @@ function extractContractObligations(document, analysis, metadata) {
   // 6. PAYMENT DEADLINES & FINANCIAL TERMS
   // ────────────────────────────────────────────────────────────
   const paymentRegexes = [
-    /(?:billed|payable)\s*(monthly|quarterly|annually|bi-weekly|in\s+advance|within\s+\d+\s*days)/i,
-    /(?:within\s+(\d+)\s*(?:calendar\s+|business\s+)?days?\s+(?:of\s+receipt|following\s+invoice|of\s+invoice))/i,
+    /(?:within\s+(\d+)\s*(?:calendar\s+|business\s+)?days?\s+(?:of\s+receipt|following\s+invoice|of\s+invoice|of\s+date\s+of\s+invoice))/i,
     /(?:net\s+(\d+)\s*days?)/i,
+    /(?:billed|payable)\s*(monthly|quarterly|annually|bi-weekly|in\s+advance|within\s+\d+\s*days)/i,
     /(?:late\s+payments?\s+accrue\s+interest\s+at\s+[\d\.]+\%\s+per\s+month)/i,
   ];
 
+  let paymentMatchCount = 0;
   for (const reg of paymentRegexes) {
     const match = cleanedDocText.match(reg);
     if (match) {
@@ -399,14 +558,16 @@ function extractContractObligations(document, analysis, metadata) {
       const sEnd = cleanedDocText.indexOf('\n', matchIdx + match[0].length);
       const paymentExcerpt = cleanedDocText.substring(sStart, sEnd !== -1 ? sEnd : matchIdx + 200).trim();
 
+      const rawPayDate = match[0].trim();
+      const cleanPayDate = normalizeDisplayTerms(rawPayDate);
       items.push({
-        id: `ob-payment-${items.length}`,
+        id: `ob-payment-${paymentMatchCount}`,
         category: 'PAYMENT_DEADLINE',
         title: 'Payment Schedule & Billing Deadline',
-        date: match[0].trim(),
+        date: cleanPayDate,
         parsedDate: null,
-        dateType: match[1]?.includes('days') ? 'relative_duration' : 'periodic_milestone',
-        certainty: 'EXPLICIT',
+        dateType: 'relative_duration',
+        certainty: 'INFERRED',
         uncertaintyReason: null,
         sourcePassage: paymentExcerpt,
         page: 1,
@@ -415,7 +576,8 @@ function extractContractObligations(document, analysis, metadata) {
         actionRequired: 'Disburse scheduled compensation or invoice payments according to terms.',
         reminderApplicable: true,
       });
-      break;
+      paymentMatchCount++;
+      if (paymentMatchCount >= 2) break;
     }
   }
 
@@ -424,7 +586,7 @@ function extractContractObligations(document, analysis, metadata) {
   // ────────────────────────────────────────────────────────────
 
   // A. Post-termination Non-Compete Period
-  const nonCompeteRegex = /(?:not\s+to\s+engage\s+in\s+competing|shall\s+not\s+compete)[^.\n]{0,120}?for\s+(?:a\s+period\s+of\s*)?(?:[a-zA-Z]+\s+)?\(?(\d+)\)?\s*(months?|years?)/i;
+  const nonCompeteRegex = /(?:not\s+to\s+engage\s+in\s+competing|shall\s+not\s+compete)[^.]{0,120}?for\s+(?:a\s+period\s+of\s*)?(?:[a-zA-Z]+\s+)?\(?(\d+)\)?\s*(months?|years?)/i;
   const ncMatch = cleanedDocText.match(nonCompeteRegex);
   if (ncMatch) {
     const ncDuration = `${ncMatch[1]} ${ncMatch[2]}`;
@@ -447,7 +609,7 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   // B. Vacation & Leave Entitlements
-  const leaveRegex = /(?:entitled\s+to)\s*(\d+\s*(?:business\s+|calendar\s+)?days?\s+of\s+paid\s+(?:vacation|leave)[^.\n]{0,100})/i;
+  const leaveRegex = /(?:entitled\s+to)\s*(\d+\s*(?:business\s+|calendar\s+)?days?\s+of\s+paid\s+(?:vacation|leave)[^.]{0,100})/i;
   const leaveMatch = cleanedDocText.match(leaveRegex);
   if (leaveMatch) {
     items.push({
@@ -469,7 +631,7 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   // C. Confidentiality Period
-  const confRegex = /(?:confidentiality|proprietary\s+information)[^.\n]{0,100}?(?:for\s+(\d+\s*(?:years?|months?))|during\s+employment\s+and\s+for\s+(\d+\s*years?)\s+thereafter|perpetual|indefinite)/i;
+  const confRegex = /(?:confidentiality|proprietary\s+information)[^.]{0,100}?(?:for\s+(\d+\s*(?:years?|months?))|during\s+employment\s+and\s+for\s+(\d+\s*years?)\s+thereafter|perpetual|indefinite)/i;
   const confMatch = cleanedDocText.match(confRegex);
   if (confMatch) {
     const confDuration = confMatch[1] || confMatch[2] || 'Survival Period';
@@ -492,7 +654,7 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   // C. Breach / Data Incident Notification Deadline
-  const breachNotifyRegex = /(?:notify\s+(?:client|company|employer)[^.\n]{0,80}?within\s+(\d+\s*(?:hours?|business\s+days?|days?))\s+of\s+(?:discovery|breach|incident))/i;
+  const breachNotifyRegex = /(?:notify\s+(?:client|company|employer)[^.]{0,80}?within\s+(\d+\s*(?:hours?|business\s+days?|days?))\s+of\s+(?:discovery|breach|incident))/i;
   const breachMatch = cleanedDocText.match(breachNotifyRegex);
   if (breachMatch) {
     const windowStr = breachMatch[1];
@@ -515,7 +677,7 @@ function extractContractObligations(document, analysis, metadata) {
   }
 
   // D. Indemnification Covenant
-  const indemRegex = /(?:indemnify\s+(?:and\s+hold\s+harmless\s+)?(?:the\s+)?(?:employer|client|company|provider)[^.\n]{0,250}\.)/i;
+  const indemRegex = /(?:indemnify\s+(?:and\s+hold\s+harmless\s+)?(?:the\s+)?(?:employer|client|company|provider)[^.]{0,250}\.)/i;
   const indemMatch = cleanedDocText.match(indemRegex);
   if (indemMatch) {
     items.push({
@@ -536,22 +698,116 @@ function extractContractObligations(document, analysis, metadata) {
     });
   }
 
-  // Deduplicate items by ID
+  // ────────────────────────────────────────────────────────────
+  // 8. MERGE AI SERVICE STRUCTURED OBLIGATIONS & CLAUSES
+  // ────────────────────────────────────────────────────────────
+  if (analysis && Array.isArray(analysis.structuredObligations) && analysis.structuredObligations.length > 0) {
+    for (const [idx, so] of analysis.structuredObligations.entries()) {
+      if (!so || typeof so !== 'object') continue;
+      const respParty = so.bound_party || so.boundParty || so.responsible_party || so.responsibleParty || 'Obligated Party';
+      const obligTitle = so.title || so.obligation || so.action || 'Contractual Obligation';
+      const obligDesc = so.obligation || so.action || obligTitle;
+      const actionText = so.action || so.obligation || obligTitle;
+      const deadlineStr = so.deadline || 'Specified in Agreement';
+      const parsedD = parseCalendarDate(deadlineStr);
+      const isExplicitDate = Boolean(parsedD);
+      const tempClass = (so.temporal_classification || so.temporalClassification || '').toUpperCase();
+
+      let category = so.category || 'AFFIRMATIVE_OBLIGATION';
+      if (!so.category) {
+        const textToMatch = `${obligDesc} ${so.source_clause || ''} ${so.conditions || ''}`.toLowerCase();
+        if (/payment|fee|invoice|remuneration|salary|compensation|price/i.test(textToMatch)) {
+          category = 'PAYMENT_DEADLINE';
+        } else if (/termination|terminate|cancel/i.test(textToMatch)) {
+          category = 'TERMINATION_DEADLINE';
+        } else if (/notice|notify|reporting|report|incident|breach/i.test(textToMatch)) {
+          category = 'NOTICE_PERIOD';
+        } else if (/renewal|renew|extension|extend/i.test(textToMatch)) {
+          category = 'RENEWAL_DATE';
+        } else if (/expiration|expire|term end/i.test(textToMatch)) {
+          category = 'EXPIRATION_DATE';
+        } else if (/effective|commence|start/i.test(textToMatch)) {
+          category = 'START_DATE';
+        }
+      }
+
+      let certainty = so.certainty || (isExplicitDate ? 'EXPLICIT' : 'INFERRED');
+      if (!so.certainty) {
+        if (tempClass === 'DURATION' || tempClass === 'SURVIVAL_PERIOD' || tempClass === 'PERIODIC') {
+          certainty = 'INFERRED';
+        } else if (tempClass === 'CONDITION_TRIGGERED_PERIOD' || tempClass === 'CONDITIONAL') {
+          certainty = 'CONDITIONAL';
+        } else if (/not\s+specified|unspecified|as\s+applicable|upon\s+notice/i.test(deadlineStr)) {
+          certainty = 'UNCERTAIN';
+        }
+      }
+
+      const cleanDeadline = normalizeDisplayTerms(deadlineStr);
+      const cleanClauseName = (so.source_clause || `item-${idx}`).replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+      items.push({
+        id: so.id || `ob-ai-${idx}-${cleanClauseName}`,
+        category,
+        title: obligTitle,
+        date: cleanDeadline,
+        rawDateText: deadlineStr,
+        formattedDueDate: cleanDeadline,
+        parsedDate: toIsoDate(parsedD),
+        dateType: isExplicitDate ? 'explicit_calendar' : (tempClass === 'DURATION' ? 'relative_duration' : 'conditional_trigger'),
+        certainty,
+        uncertaintyReason: so.conditions || null,
+        sourcePassage: so.supporting_evidence || actionText || '',
+        page: so.source_page || so.sourcePage || 1,
+        section: so.source_clause || so.sourceClause || 'General Terms',
+        party: respParty,
+        actionRequired: actionText,
+        reminderApplicable: isExplicitDate || category === 'PAYMENT_DEADLINE' || category === 'NOTICE_PERIOD',
+      });
+    }
+  }
+
+  // Deduplication and normalization
+  // If an explicit or inferred start date was found, remove placeholder 'ob-start-date-missing'
+  const hasRealStartDate = items.some(i => i.category === 'START_DATE' && i.id !== 'ob-start-date-missing');
+  const itemsWithoutMissingStart = hasRealStartDate
+    ? items.filter(i => i.id !== 'ob-start-date-missing')
+    : items;
+
+  // If a valid expiration date or duration is present, remove placeholder 'ob-expiration-date-indefinite'
+  const hasRealExpiry = itemsWithoutMissingStart.some(i => i.category === 'EXPIRATION_DATE' && i.id !== 'ob-expiration-date-indefinite');
+  const filteredItems = hasRealExpiry
+    ? itemsWithoutMissingStart.filter(i => i.id !== 'ob-expiration-date-indefinite')
+    : itemsWithoutMissingStart;
+
   const dedupedItems = [];
   const seenIds = new Set();
-  for (const item of items) {
-    if (!seenIds.has(item.id)) {
+  const seenSignatures = new Set();
+  for (const item of filteredItems) {
+    const sig = `${item.category}:${(item.title || '').trim().toLowerCase()}`;
+    if (!seenIds.has(item.id) && !seenSignatures.has(sig)) {
       seenIds.add(item.id);
+      seenSignatures.add(sig);
       dedupedItems.push(item);
     }
+  }
+
+  // Populate field aliases on all deduped items
+  for (const item of dedupedItems) {
+    if (!item.rawDateText) item.rawDateText = item.date;
+    if (!item.formattedDueDate) item.formattedDueDate = normalizeDisplayTerms(item.date);
+    if (!item.parsedDueDate) item.parsedDueDate = item.parsedDate || null;
+    if (!item.boundParty) item.boundParty = item.party;
+    if (!item.action) item.action = item.actionRequired;
+    if (!item.supportingEvidence) item.supportingEvidence = item.sourcePassage;
   }
 
   // Build summary metrics
   const summary = {
     totalItems: dedupedItems.length,
-    explicitCount: dedupedItems.filter(i => i.certainty === 'EXPLICIT').length,
-    inferredCount: dedupedItems.filter(i => i.certainty === 'INFERRED').length,
-    uncertainCount: dedupedItems.filter(i => i.certainty === 'UNCERTAIN' || i.certainty === 'CONDITIONAL').length,
+    explicitCount: dedupedItems.filter(i => i.dateType === 'explicit_calendar' && i.certainty === 'EXPLICIT').length,
+    relativeCount: dedupedItems.filter(i => i.dateType === 'relative_duration').length,
+    conditionalCount: dedupedItems.filter(i => i.dateType === 'conditional_trigger' || i.certainty === 'CONDITIONAL' || i.certainty === 'UNCERTAIN').length,
+    inferredCount: dedupedItems.filter(i => i.dateType === 'relative_duration').length,
+    uncertainCount: dedupedItems.filter(i => i.dateType === 'conditional_trigger' || i.certainty === 'CONDITIONAL' || i.certainty === 'UNCERTAIN').length,
     categories: {
       startDate: dedupedItems.filter(i => i.category === 'START_DATE').length,
       expirationDate: dedupedItems.filter(i => i.category === 'EXPIRATION_DATE').length,
@@ -565,10 +821,11 @@ function extractContractObligations(document, analysis, metadata) {
   };
 
   return {
-    documentId: document._id,
-    documentName: document.originalName,
+    documentId: docObj._id || null,
+    documentName: docObj.originalName || null,
     summary,
     timeline: dedupedItems,
+    obligations: dedupedItems,
   };
 }
 
@@ -611,5 +868,7 @@ function generateIcsCalendar(reminder, document) {
 module.exports = {
   extractContractObligations,
   parseCalendarDate,
+  toIsoDate,
+  normalizeDisplayTerms,
   generateIcsCalendar,
 };

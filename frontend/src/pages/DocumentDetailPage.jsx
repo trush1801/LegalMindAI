@@ -397,7 +397,10 @@ export default function DocumentDetailPage() {
               {metadata?.pageCount && (
                 <>
                   <span>·</span>
-                  <span>{metadata.pageCount} {metadata.pageCount === 1 ? 'PAGE' : 'PAGES'}</span>
+                  <span>
+                    {metadata.pageCount} {metadata.pageCount === 1 ? 'PAGE' : 'PAGES'}
+                    {metadata.pageCountIsEstimated ? ' (EST.)' : ''}
+                  </span>
                 </>
               )}
               {metadata?.detectedLanguage && (

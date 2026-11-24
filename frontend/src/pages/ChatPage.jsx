@@ -28,14 +28,17 @@ export default function ChatPage() {
   const [documents, setDocuments] = useState([]);
   const [selectedDocId, setSelectedDocId] = useState(initialDocId);
   const [loadingDocs, setLoadingDocs] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(false);
 
-  const [messages, setMessages] = useState([
-    {
-      sender: 'ai',
-      text: 'Welcome to the Legal Analysis Assistant. Select a contract from the active context list to query specific liabilities, inspect clause obligations, or examine critical deadlines.',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    },
-  ]);
+  const getWelcomeMessage = (doc) => ({
+    sender: 'ai',
+    text: doc
+      ? `Welcome to the Legal Analysis Assistant for "${doc.title || doc.originalName}". You can query specific liabilities, examine contractual obligations, inspect termination terms, or verify compliance deadlines.`
+      : 'Welcome to the Legal Analysis Assistant. Select a contract from the active context list to query specific liabilities, inspect clause obligations, or examine critical deadlines.',
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  });
+
+  const [messages, setMessages] = useState([getWelcomeMessage(null)]);
   const [inputQuestion, setInputQuestion] = useState('');
   const [querying, setQuerying] = useState(false);
   const [error, setError] = useState('');
@@ -70,9 +73,73 @@ export default function ChatPage() {
     fetchDocs();
   }, []);
 
+  // Synchronize persistent chat history when selected document changes (ERR-UI-001)
+  useEffect(() => {
+    if (!selectedDocId) {
+      setMessages([getWelcomeMessage(null)]);
+      return;
+    }
+
+    let isSubscribed = true;
+
+    const loadHistory = async () => {
+      setLoadingHistory(true);
+      setError('');
+      try {
+        const res = await documentAPI.getChatHistory(selectedDocId);
+        if (!isSubscribed) return;
+
+        const rawMessages =
+          res?.data?.data?.messages ||
+          res?.data?.messages ||
+          (Array.isArray(res?.data) ? res.data : []);
+
+        if (Array.isArray(rawMessages) && rawMessages.length > 0) {
+          const formatted = rawMessages.map((m, idx) => {
+            const isUser = m.role === 'user';
+            const ts = m.timestamp ? new Date(m.timestamp) : null;
+            const timeStr = ts && !isNaN(ts.getTime())
+              ? ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+              : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            return {
+              id: m._id || `msg_${idx}`,
+              sender: isUser ? 'user' : 'ai',
+              text: m.content || m.answer || m.text || '',
+              intent: m.queryType || m.intent || null,
+              path: m.routedPath || m.path || null,
+              evidenceScore: m.evidenceScore ?? (m.evidenceFound ? 1.0 : null),
+              citations: m.citations || [],
+              timestamp: timeStr,
+            };
+          });
+          setMessages(formatted);
+        } else {
+          const doc = documents.find((d) => (d._id || d.id) === selectedDocId);
+          setMessages([getWelcomeMessage(doc)]);
+        }
+      } catch (err) {
+        if (!isSubscribed) return;
+        console.warn(`Could not load chat history for doc ${selectedDocId}:`, err);
+        const doc = documents.find((d) => (d._id || d.id) === selectedDocId);
+        setMessages([getWelcomeMessage(doc)]);
+      } finally {
+        if (isSubscribed) {
+          setLoadingHistory(false);
+        }
+      }
+    };
+
+    loadHistory();
+
+    return () => {
+      isSubscribed = false;
+    };
+  }, [selectedDocId, documents]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, querying]);
+  }, [messages, querying, loadingHistory]);
 
   const handleSend = async (e, customText = null) => {
     if (e && e.preventDefault) e.preventDefault();
@@ -239,90 +306,98 @@ export default function ChatPage() {
 
             {/* Conversation Messages */}
             <div className="chat-messages">
-              {messages.map((msg, idx) => (
-                <div key={idx} className={`chat-message ${msg.sender}`}>
-                  <div className={`chat-avatar ${msg.sender === 'user' ? 'user-avatar-icon' : 'ai-avatar-icon'}`}>
-                    {msg.sender === 'user' ? <User size={15} /> : <Bot size={15} />}
-                  </div>
-
-                  <div className="chat-bubble">
-                    {msg.sender === 'ai' && msg.intent && (
-                      <div className="rag-meta-strip">
-                        {getSchemaBadge(msg.intent)}
-                        {getPathBadge(msg.path)}
-                        {msg.evidenceScore && (
-                          <span className="badge badge-success flex-center gap-1">
-                            <CheckCircle2 size={11} /> Support: {(msg.evidenceScore * 100).toFixed(0)}%
-                          </span>
-                        )}
+              {loadingHistory ? (
+                <div style={{ display: 'grid', placeItems: 'center', height: '100%', minHeight: '200px' }}>
+                  <Spinner label="Loading conversation history…" />
+                </div>
+              ) : (
+                <>
+                  {messages.map((msg, idx) => (
+                    <div key={idx} className={`chat-message ${msg.sender}`}>
+                      <div className={`chat-avatar ${msg.sender === 'user' ? 'user-avatar-icon' : 'ai-avatar-icon'}`}>
+                        {msg.sender === 'user' ? <User size={15} /> : <Bot size={15} />}
                       </div>
-                    )}
 
-                    <div style={{ whiteSpace: 'pre-line' }}>{msg.text}</div>
-
-                    {/* Citations Excerpt */}
-                    {msg.citations && msg.citations.length > 0 && (
-                      <div style={{ marginTop: '0.85rem', borderTop: '1px solid var(--color-border)', paddingTop: '0.6rem' }}>
-                        <div className="text-xs flex-center gap-1" style={{ fontWeight: 600, color: 'var(--color-text)', marginBottom: '0.4rem' }}>
-                          <BookOpen size={13} /> Grounded Document Citations ({msg.citations.length})
-                        </div>
-
-                        {msg.citations.map((cit, cIdx) => (
-                          <div key={cIdx} className="citation-card">
-                            <div className="citation-source">
-                              <span>Page {cit.page || cit.pageNumber || 'N/A'} · Section: {cit.section || 'Extracted Clause'}</span>
-                              {cit.matchRatio && (
-                                <span className="muted" style={{ fontSize: '10px' }}>
-                                  {(cit.matchRatio * 100).toFixed(0)}% Match
-                                </span>
-                              )}
-                            </div>
-                            <div className="citation-excerpt">
-                              "{cit.excerpt || cit.text || cit.clauseText}"
-                            </div>
+                      <div className="chat-bubble">
+                        {msg.sender === 'ai' && msg.intent && (
+                          <div className="rag-meta-strip">
+                            {getSchemaBadge(msg.intent)}
+                            {getPathBadge(msg.path)}
+                            {msg.evidenceScore && (
+                              <span className="badge badge-success flex-center gap-1">
+                                <CheckCircle2 size={11} /> Support: {(msg.evidenceScore * 100).toFixed(0)}%
+                              </span>
+                            )}
                           </div>
+                        )}
+
+                        <div style={{ whiteSpace: 'pre-line' }}>{msg.text}</div>
+
+                        {/* Citations Excerpt */}
+                        {msg.citations && msg.citations.length > 0 && (
+                          <div style={{ marginTop: '0.85rem', borderTop: '1px solid var(--color-border)', paddingTop: '0.6rem' }}>
+                            <div className="text-xs flex-center gap-1" style={{ fontWeight: 600, color: 'var(--color-text)', marginBottom: '0.4rem' }}>
+                              <BookOpen size={13} /> Grounded Document Citations ({msg.citations.length})
+                            </div>
+
+                            {msg.citations.map((cit, cIdx) => (
+                              <div key={cIdx} className="citation-card">
+                                <div className="citation-source">
+                                  <span>Page {cit.page || cit.pageNumber || 'N/A'} · Section: {cit.section || 'Extracted Clause'}</span>
+                                  {cit.matchRatio && (
+                                    <span className="muted" style={{ fontSize: '10px' }}>
+                                      {(cit.matchRatio * 100).toFixed(0)}% Match
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="citation-excerpt">
+                                  "{cit.excerpt || cit.text || cit.clauseText}"
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="text-xs text-mono muted" style={{ textAlign: 'right', marginTop: '0.4rem', fontSize: '10px' }}>
+                          {msg.timestamp}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+
+                  {querying && (
+                    <div className="chat-message ai">
+                      <div className="chat-avatar ai-avatar-icon">
+                        <Bot size={15} />
+                      </div>
+                      <div className="chat-bubble flex-center gap-2">
+                        <Spinner label="" />
+                        <span className="text-sm muted">
+                          Executing retrieval pipeline and validating citations…
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Suggested Questions */}
+                  {messages.length === 1 && selectedDoc && !querying && (
+                    <div style={{ marginTop: 'auto', paddingTop: '1rem' }}>
+                      <div className="form-hint" style={{ marginBottom: '0.5rem' }}>Suggested Questions:</div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                        {SUGGESTED_QUERIES.map((sq, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleSend(null, sq)}
+                          >
+                            {sq}
+                          </button>
                         ))}
                       </div>
-                    )}
-
-                    <div className="text-xs text-mono muted" style={{ textAlign: 'right', marginTop: '0.4rem', fontSize: '10px' }}>
-                      {msg.timestamp}
                     </div>
-                  </div>
-                </div>
-              ))}
-
-              {querying && (
-                <div className="chat-message ai">
-                  <div className="chat-avatar ai-avatar-icon">
-                    <Bot size={15} />
-                  </div>
-                  <div className="chat-bubble flex-center gap-2">
-                    <Spinner label="" />
-                    <span className="text-sm muted">
-                      Executing retrieval pipeline and validating citations…
-                    </span>
-                  </div>
-                </div>
-              )}
-
-              {/* Suggested Questions */}
-              {messages.length === 1 && selectedDoc && !querying && (
-                <div style={{ marginTop: 'auto', paddingTop: '1rem' }}>
-                  <div className="form-hint" style={{ marginBottom: '0.5rem' }}>Suggested Questions:</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
-                    {SUGGESTED_QUERIES.map((sq, i) => (
-                      <button
-                        key={i}
-                        type="button"
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => handleSend(null, sq)}
-                      >
-                        {sq}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                  )}
+                </>
               )}
 
               <div ref={messagesEndRef} />
